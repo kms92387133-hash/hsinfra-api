@@ -11,7 +11,7 @@ import zipfile
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from supabase import create_client
@@ -54,10 +54,24 @@ class InspectionPhotoUpload(BaseModel):
 
 
 class InspectionUpload(BaseModel):
+    inspection_id: str = ""
     company_name: str
     date: str
     category: str
     photos: List[InspectionPhotoUpload] = Field(default_factory=list)
+
+
+class InspectionCreate(BaseModel):
+    company_name: str
+    date: str
+    category: str
+
+
+class InspectionScheduleCreate(BaseModel):
+    company_name: str
+    date: str
+    category: str
+    time: str = ""
 
 
 def clean_path_segment(value: str) -> str:
@@ -543,7 +557,11 @@ def upload_photo_to_filestation(
 ) -> str:
     base_url, sid = filestation_login()
     _, _, _, root_path = get_filestation_config()
-    inspection_dir = clean_path_segment(f"{compact_date(date)} ({category}) {company_name}")
+    inspection_dir = inspection_folder_name(
+        company_name=company_name,
+        date=date,
+        category=category,
+    )
     safe_file_name = clean_path_segment(file_name)
     upload_dir = f"{root_path}/{inspection_dir}"
     nas_path = f"{upload_dir}/{safe_file_name}"
@@ -580,6 +598,118 @@ def upload_photo_to_filestation(
     finally:
         filestation_logout(base_url, sid)
 
+
+def inspection_folder_name(*, company_name: str, date: str, category: str) -> str:
+    return clean_path_segment(f"{compact_date(date)} ({category}) {company_name}")
+
+
+def inspection_folder_path(*, company_name: str, date: str, category: str) -> str:
+    _, _, _, root_path = get_filestation_config()
+    return f"{root_path}/{inspection_folder_name(company_name=company_name, date=date, category=category)}"
+
+
+def filestation_rename_path(path: str, new_name: str) -> None:
+    if not path or not path.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid NAS path.")
+
+    base_url, sid = filestation_login()
+    try:
+        response = requests.get(
+            f"{base_url}/webapi/entry.cgi",
+            params={
+                "api": "SYNO.FileStation.Rename",
+                "version": "2",
+                "method": "rename",
+                "path": path,
+                "name": new_name,
+                "_sid": sid,
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("success"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"NAS File Station rename failed: {payload}",
+            )
+    finally:
+        filestation_logout(base_url, sid)
+
+
+def sync_inspection_nas_folder(
+    *,
+    inspection_id: str,
+    old_company_name: str,
+    old_date: str,
+    old_category: str,
+    new_company_name: str,
+    new_date: str,
+    new_category: str,
+) -> None:
+    old_dir = inspection_folder_path(
+        company_name=old_company_name,
+        date=old_date,
+        category=old_category,
+    )
+    new_dir_name = inspection_folder_name(
+        company_name=new_company_name,
+        date=new_date,
+        category=new_category,
+    )
+    new_dir = inspection_folder_path(
+        company_name=new_company_name,
+        date=new_date,
+        category=new_category,
+    )
+    if old_dir == new_dir:
+        return
+
+    photos = (
+        supabase.table("inspection_photos")
+        .select("id, storage_path")
+        .eq("inspection_id", inspection_id)
+        .execute()
+    )
+    if not photos.data:
+        return
+
+    filestation_rename_path(old_dir, new_dir_name)
+
+    for photo in photos.data:
+        storage_path = photo.get("storage_path") or ""
+        if not storage_path.startswith(f"{old_dir}/"):
+            continue
+        new_storage_path = storage_path.replace(old_dir, new_dir, 1)
+        supabase.table("inspection_photos").update(
+            {"storage_path": new_storage_path}
+        ).eq("id", photo["id"]).execute()
+
+
+
+
+def download_photo_from_filestation(storage_path: str) -> bytes:
+    if not storage_path or not storage_path.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid NAS storage_path.")
+
+    base_url, sid = filestation_login()
+    try:
+        response = requests.get(
+            f"{base_url}/webapi/entry.cgi",
+            params={
+                "api": "SYNO.FileStation.Download",
+                "version": "2",
+                "method": "download",
+                "path": storage_path,
+                "mode": "download",
+                "_sid": sid,
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        return response.content
+    finally:
+        filestation_logout(base_url, sid)
 
 def webdav_url(base_url: str, relative_path: str) -> str:
     parts = [quote(part, safe="") for part in relative_path.split("/") if part]
@@ -693,6 +823,16 @@ def ensure_company(company_name: str) -> str:
 
 
 def create_inspection(company_id: str, inspection: InspectionUpload) -> str:
+    if inspection.inspection_id.strip():
+        supabase.table("inspections").update(
+            {
+                "company_id": company_id,
+                "date": inspection.date,
+                "category": inspection.category,
+            }
+        ).eq("id", inspection.inspection_id.strip()).execute()
+        return inspection.inspection_id.strip()
+
     inserted = (
         supabase.table("inspections")
         .insert(
@@ -706,6 +846,31 @@ def create_inspection(company_id: str, inspection: InspectionUpload) -> str:
     )
 
     return str(inserted.data[0]["id"])
+
+
+def inspection_payload_from_create(inspection: InspectionCreate) -> dict:
+    company_name = inspection.company_name.strip()
+    if not company_name:
+        raise HTTPException(status_code=400, detail="company_name is required.")
+    company_id = ensure_company(company_name)
+    return {
+        "company_id": company_id,
+        "date": inspection.date,
+        "category": inspection.category,
+    }
+
+
+def schedule_payload_from_create(schedule: InspectionScheduleCreate) -> dict:
+    company_name = schedule.company_name.strip()
+    if not company_name:
+        raise HTTPException(status_code=400, detail="company_name is required.")
+    company_id = ensure_company(company_name)
+    return {
+        "company_id": company_id,
+        "date": schedule.date,
+        "category": schedule.category,
+        "time": schedule.time,
+    }
 
 
 @app.get("/")
@@ -778,6 +943,151 @@ def sync_companies_from_spreadsheet():
     return result
 
 
+
+@app.get("/inspections")
+@app.get("/api/inspections")
+def get_inspections():
+    result = (
+        supabase.table("inspections")
+        .select(
+            "id, company_id, date, category, created_at, "
+            "companies(company_name), "
+            "inspection_photos(id, facility_name, photo_title, file_name, storage_path, sort_order, uploaded_to_nas)"
+        )
+        .order("date", desc=True)
+        .execute()
+    )
+    return result.data
+
+
+@app.post("/inspections")
+@app.post("/api/inspections")
+def create_inspection_record(inspection: InspectionCreate):
+    payload = inspection_payload_from_create(inspection)
+    result = supabase.table("inspections").insert(payload).execute()
+    return result.data[0]
+
+
+@app.put("/inspections/{inspection_id}")
+@app.put("/api/inspections/{inspection_id}")
+def update_inspection_record(inspection_id: str, inspection: InspectionCreate):
+    existing = (
+        supabase.table("inspections")
+        .select("id, date, category, companies(company_name)")
+        .eq("id", inspection_id)
+        .limit(1)
+        .execute()
+    )
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Inspection not found.")
+
+    existing_row = existing.data[0]
+    existing_company = existing_row.get("companies") or {}
+    old_company_name = existing_company.get("company_name", "")
+    old_date = existing_row.get("date", "")
+    old_category = existing_row.get("category", "")
+
+    payload = inspection_payload_from_create(inspection)
+    result = (
+        supabase.table("inspections")
+        .update(payload)
+        .eq("id", inspection_id)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Inspection not found.")
+
+    try:
+        sync_inspection_nas_folder(
+            inspection_id=inspection_id,
+            old_company_name=old_company_name,
+            old_date=old_date,
+            old_category=old_category,
+            new_company_name=inspection.company_name.strip(),
+            new_date=inspection.date,
+            new_category=inspection.category,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"NAS folder rename failed: {exc}",
+        ) from exc
+
+    return result.data[0]
+
+
+@app.delete("/inspections/{inspection_id}")
+@app.delete("/api/inspections/{inspection_id}")
+def delete_inspection_record(inspection_id: str):
+    supabase.table("inspection_photos").delete().eq(
+        "inspection_id", inspection_id
+    ).execute()
+    supabase.table("inspections").delete().eq("id", inspection_id).execute()
+    return {"deleted": True, "id": inspection_id}
+
+
+@app.get("/schedules")
+@app.get("/api/schedules")
+def get_schedules():
+    result = (
+        supabase.table("inspection_schedules")
+        .select(
+            "id, company_id, date, category, time, created_at, companies(company_name)"
+        )
+        .order("date", desc=True)
+        .execute()
+    )
+    return result.data
+
+
+@app.post("/schedules")
+@app.post("/api/schedules")
+def create_schedule(schedule: InspectionScheduleCreate):
+    payload = schedule_payload_from_create(schedule)
+    result = supabase.table("inspection_schedules").insert(payload).execute()
+    return result.data[0]
+
+
+@app.put("/schedules/{schedule_id}")
+@app.put("/api/schedules/{schedule_id}")
+def update_schedule(schedule_id: str, schedule: InspectionScheduleCreate):
+    payload = schedule_payload_from_create(schedule)
+    result = (
+        supabase.table("inspection_schedules")
+        .update(payload)
+        .eq("id", schedule_id)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Schedule not found.")
+    return result.data[0]
+
+
+@app.delete("/schedules/{schedule_id}")
+@app.delete("/api/schedules/{schedule_id}")
+def delete_schedule(schedule_id: str):
+    supabase.table("inspection_schedules").delete().eq("id", schedule_id).execute()
+    return {"deleted": True, "id": schedule_id}
+
+
+@app.get("/inspection-photos/{photo_id}/image")
+@app.get("/api/inspection-photos/{photo_id}/image")
+def get_inspection_photo_image(photo_id: str):
+    photo = (
+        supabase.table("inspection_photos")
+        .select("id, storage_path")
+        .eq("id", photo_id)
+        .limit(1)
+        .execute()
+    )
+    if not photo.data:
+        raise HTTPException(status_code=404, detail="Photo not found.")
+
+    storage_path = photo.data[0].get("storage_path", "")
+    content = download_photo_from_filestation(storage_path)
+    return Response(content=content, media_type="image/jpeg")
 @app.post("/inspections/upload")
 @app.post("/api/inspections/upload")
 def upload_inspection(inspection: InspectionUpload):
@@ -792,6 +1102,7 @@ def upload_inspection(inspection: InspectionUpload):
     inspection_id = create_inspection(company_id, inspection)
 
     uploaded_count = 0
+    uploaded_photos = []
     for photo in inspection.photos:
         try:
             content = base64.b64decode(photo.content_base64, validate=True)
@@ -809,15 +1120,32 @@ def upload_inspection(inspection: InspectionUpload):
             content=content,
         )
 
-        supabase.table("inspection_photos").insert(
+        inserted_photo = (
+            supabase.table("inspection_photos")
+            .insert(
+                {
+                    "inspection_id": inspection_id,
+                    "facility_name": photo.facility_name,
+                    "photo_title": photo.photo_title,
+                    "file_name": photo.file_name,
+                    "storage_path": nas_path,
+                    "sort_order": photo.sort_order,
+                    "uploaded_to_nas": True,
+                }
+            )
+            .execute()
+        )
+        photo_row = inserted_photo.data[0] if inserted_photo.data else {}
+        uploaded_photos.append(
             {
-                "inspection_id": inspection_id,
+                "id": str(photo_row.get("id", "")),
                 "facility_name": photo.facility_name,
                 "photo_title": photo.photo_title,
+                "file_name": photo.file_name,
                 "storage_path": nas_path,
                 "sort_order": photo.sort_order,
             }
-        ).execute()
+        )
 
         uploaded_count += 1
 
@@ -825,4 +1153,5 @@ def upload_inspection(inspection: InspectionUpload):
         "company_id": company_id,
         "inspection_id": inspection_id,
         "uploaded_photo_count": uploaded_count,
+        "uploaded_photos": uploaded_photos,
     }
