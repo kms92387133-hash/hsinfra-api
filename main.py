@@ -739,6 +739,31 @@ def create_company(company: CompanyCreate):
     return result.data[0]
 
 
+
+@app.delete("/companies/{company_id}")
+@app.delete("/api/companies/{company_id}")
+def delete_company(company_id: str):
+    try:
+        existing = (
+            supabase.table("companies")
+            .select("id")
+            .eq("id", company_id)
+            .limit(1)
+            .execute()
+        )
+        if not existing.data:
+            raise HTTPException(status_code=404, detail="Company not found.")
+
+        supabase.table("companies").delete().eq("id", company_id).execute()
+        return {"deleted": True, "id": company_id}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Company delete failed: {exc}",
+        ) from exc
+
 @app.post("/companies/sync-from-spreadsheet")
 @app.post("/api/companies/sync-from-spreadsheet")
 def sync_companies_from_spreadsheet():
