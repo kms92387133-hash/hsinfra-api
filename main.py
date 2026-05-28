@@ -72,6 +72,16 @@ class InspectionCreate(BaseModel):
     category: str
 
 
+class NasPhotoSyncTarget(BaseModel):
+    company_name: str
+    date: str
+    category: str
+
+
+class NasPhotoSyncRequest(BaseModel):
+    targets: List[NasPhotoSyncTarget] = Field(default_factory=list)
+
+
 class InspectionScheduleCreate(BaseModel):
     company_name: str
     date: str
@@ -853,6 +863,11 @@ def filestation_list(path: str) -> list[dict]:
         filestation_logout(base_url, sid)
 
 
+def normalize_inspection_category(value: str) -> str:
+    category = value.strip()
+    return "유지보수" if category == "유지점검" else category
+
+
 def parse_inspection_folder_name(name: str) -> dict | None:
     match = re.match(r"^(\d{8})\s+\(([^)]+)\)\s+(.+)$", name.strip())
     if not match:
@@ -860,7 +875,7 @@ def parse_inspection_folder_name(name: str) -> dict | None:
     raw_date, category, company_name = match.groups()
     return {
         "date": f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}",
-        "category": category.strip(),
+        "category": normalize_inspection_category(category),
         "company_name": resolve_company_name_from_nas(company_name.strip()),
     }
 
@@ -907,18 +922,45 @@ def ensure_inspection_for_nas_folder(company_name: str, date: str, category: str
     return str(inserted.data[0]["id"])
 
 
-def sync_nas_photo_metadata() -> dict:
+def sync_nas_photo_metadata(
+    targets: list[NasPhotoSyncTarget] | None = None,
+) -> dict:
     _, _, _, root_path = get_filestation_config()
     folders = [item for item in filestation_list(root_path) if item.get("isdir")]
+    target_keys = {
+        (
+            target.date.strip(),
+            normalize_inspection_category(target.category),
+            normalize_company_key(target.company_name),
+        )
+        for target in targets or []
+        if target.date.strip() and target.company_name.strip()
+    }
     synced_folders = 0
     synced_photos = 0
     skipped_files = 0
+    scanned_folders = 0
 
+    parsed_folders = []
     for folder in folders:
         folder_name = (folder.get("name") or "").strip()
         folder_info = parse_inspection_folder_name(folder_name)
         if folder_info is None:
             continue
+        folder_key = (
+            folder_info["date"],
+            normalize_inspection_category(folder_info["category"]),
+            normalize_company_key(folder_info["company_name"]),
+        )
+        if target_keys and folder_key not in target_keys:
+            continue
+        parsed_folders.append((folder, folder_info, folder_name))
+
+    if not target_keys:
+        parsed_folders = parsed_folders[-30:]
+
+    for folder, folder_info, folder_name in parsed_folders:
+        scanned_folders += 1
 
         folder_path = folder.get("path") or f"{root_path}/{folder_name}"
         inspection_id = ensure_inspection_for_nas_folder(
@@ -961,6 +1003,8 @@ def sync_nas_photo_metadata() -> dict:
         synced_folders += 1
 
     return {
+        "scanned_folders": scanned_folders,
+        "matched_targets": len(target_keys),
         "synced_folders": synced_folders,
         "synced_photos": synced_photos,
         "skipped_files": skipped_files,
@@ -1999,8 +2043,8 @@ def delete_schedule(schedule_id: str):
 
 @app.post("/inspections/sync-nas-photos")
 @app.post("/api/inspections/sync-nas-photos")
-def sync_nas_photos():
-    return sync_nas_photo_metadata()
+def sync_nas_photos(request: NasPhotoSyncRequest):
+    return sync_nas_photo_metadata(request.targets)
 
 
 @app.get("/inspection-photos/{photo_id}/image")
