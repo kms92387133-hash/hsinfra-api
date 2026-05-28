@@ -576,9 +576,13 @@ def upload_photo_to_filestation(
                 "_sid": sid,
             },
             data={
+                "api": "SYNO.FileStation.Upload",
+                "version": "2",
+                "method": "upload",
                 "path": upload_dir,
                 "create_parents": "true",
                 "overwrite": "true",
+                "_sid": sid,
             },
             files={
                 "file": (safe_file_name, content, "image/jpeg"),
