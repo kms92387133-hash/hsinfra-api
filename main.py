@@ -954,26 +954,47 @@ def synology_calendar():
     url, username, password = caldav_config()
     try:
         client = caldav.DAVClient(url=url, username=username, password=password)
+        
+        # 1. URL이 특정 캘린더를 직접 가리키는 경우를 테스트
+        # 사용자가 캘린더 고유 주소를 직접 입력했을 경우를 우선 처리합니다.
+        if not url.rstrip('/').endswith(username):
+            try:
+                cal = client.calendar(url=url)
+                _ = cal.name  # 캘린더 속성을 조회하여 유효한 캘린더인지 검증
+                return cal
+            except Exception:
+                pass
+
         discovery_error = None
+        # 2. Principal(사용자 계정)을 통해 캘린더 목록을 조회
         try:
             calendars = client.principal().calendars()
             if calendars:
+                # Synology Calendar의 기본 캘린더는 URL이 '/home'으로 끝납니다.
+                for cal in calendars:
+                    if str(cal.url).rstrip('/').endswith('/home'):
+                        return cal
+                
+                # 기본 캘린더가 없으면, VEVENT(일정)를 지원하는 첫 번째 캘린더를 반환합니다.
+                for cal in calendars:
+                    try:
+                        if 'VEVENT' in cal.get_supported_components():
+                            return cal
+                    except Exception:
+                        pass
+                
+                # 적절한 것을 찾지 못했다면 첫 번째 캘린더를 기본으로 반환합니다.
                 return calendars[0]
         except Exception as exc:
             discovery_error = exc
 
-        try:
-            return client.calendar(url=url)
-        except Exception as exc:
-            if discovery_error is not None:
-                raise HTTPException(
-                    status_code=502,
-                    detail=(
-                        "Synology CalDAV calendar discovery failed. "
-                        f"Principal error: {discovery_error}; calendar URL error: {exc}"
-                    ),
-                ) from exc
-            raise
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Synology CalDAV calendar discovery failed. "
+                f"Principal error: {discovery_error}"
+            ),
+        )
     except HTTPException:
         raise
     except Exception as exc:
@@ -1110,7 +1131,7 @@ def list_synology_calendar_events(start: str, end: str) -> list[dict]:
     if end_at <= start_at:
         raise HTTPException(status_code=400, detail="end must be after start.")
     try:
-        events = calendar.date_search(start=start_at, end=end_at, expand=True)
+        events = calendar.date_search(start=start_at, end=end_at)
     except Exception as exc:
         raise HTTPException(
             status_code=502,
@@ -1366,6 +1387,17 @@ def delete_inspection_record(inspection_id: str):
     supabase.table("inspections").delete().eq("id", inspection_id).execute()
     return {"deleted": True, "id": inspection_id}
 
+
+@app.get("/calendar/check")
+@app.get("/api/calendar/check")
+def check_calendar_connection():
+    cal = synology_calendar()
+    return {
+        "success": True,
+        "message": "Synology Calendar connection successful.",
+        "calendar_name": getattr(cal, "name", "Unknown"),
+        "calendar_url": str(getattr(cal, "url", ""))
+    }
 
 
 @app.get("/calendar/events")
