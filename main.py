@@ -83,6 +83,7 @@ class CalendarEventCreate(BaseModel):
     start_at: str
     end_at: str
     memo: str = ""
+    location: str = ""
 
 
 def clean_path_segment(value: str) -> str:
@@ -1079,6 +1080,37 @@ def parse_ics_datetime(value: str) -> str:
         return raw
 
 
+def company_address_for_calendar(company_name: str) -> str:
+    target = company_name.strip()
+    if not target:
+        return ""
+    try:
+        result = (
+            supabase.table("companies")
+            .select("address")
+            .eq("company_name", target)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if rows:
+            return (rows[0].get("address") or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def calendar_event_object(uid: str):
+    calendar = synology_calendar()
+    try:
+        return calendar.event_by_uid(uid)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Synology CalDAV event not found: {exc}",
+        ) from exc
+
+
 def calendar_event_to_json(event) -> dict:
     data = unfold_ics(getattr(event, "data", "") or "")
     memo = ics_field(data, "DESCRIPTION").replace("\\n", "\n")
@@ -1092,23 +1124,29 @@ def calendar_event_to_json(event) -> dict:
         "company_name": company_name,
         "title": ics_field(data, "SUMMARY"),
         "memo": memo,
+        "location": ics_field(data, "LOCATION"),
         "start_at": parse_ics_datetime(ics_field(data, "DTSTART")),
         "end_at": parse_ics_datetime(ics_field(data, "DTEND")),
     }
 
 
-def create_synology_calendar_event(event: CalendarEventCreate) -> dict:
+def create_synology_calendar_event(
+    event: CalendarEventCreate,
+    uid_override: str | None = None,
+) -> dict:
     calendar = synology_calendar()
     start_at = parse_event_datetime(event.start_at)
     end_at = parse_event_datetime(event.end_at)
     if end_at <= start_at:
         raise HTTPException(status_code=400, detail="end_at must be after start_at.")
 
-    uid = f"{uuid.uuid4()}@hsinfra"
+    uid = uid_override or f"{uuid.uuid4()}@hsinfra"
     title = event.title.strip() or event.company_name.strip() or "일정"
     description = event.memo.strip()
-    if event.company_name.strip():
-        description = f"업체명: {event.company_name.strip()}\n{description}".strip()
+    company_name = event.company_name.strip()
+    if company_name:
+        description = f"업체명: {company_name}\n{description}".strip()
+    location = event.location.strip() or company_address_for_calendar(company_name)
 
     ics = "\r\n".join(
         [
@@ -1122,6 +1160,7 @@ def create_synology_calendar_event(event: CalendarEventCreate) -> dict:
             format_ics_datetime_line("DTEND", end_at),
             f"SUMMARY:{escape_ics_text(title)}",
             f"DESCRIPTION:{escape_ics_text(description)}",
+            *([f"LOCATION:{escape_ics_text(location)}"] if location else []),
             "END:VEVENT",
             "END:VCALENDAR",
             "",
@@ -1142,8 +1181,33 @@ def create_synology_calendar_event(event: CalendarEventCreate) -> dict:
         "title": title,
         "start_at": start_at.isoformat(),
         "end_at": end_at.isoformat(),
+        "location": location,
         "url": str(getattr(saved, "url", "")),
     }
+
+
+def update_synology_calendar_event(uid: str, event: CalendarEventCreate) -> dict:
+    existing = calendar_event_object(uid)
+    try:
+        existing.delete()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Synology CalDAV event delete before update failed: {exc}",
+        ) from exc
+    return create_synology_calendar_event(event, uid_override=uid)
+
+
+def delete_synology_calendar_event(uid: str) -> dict:
+    existing = calendar_event_object(uid)
+    try:
+        existing.delete()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Synology CalDAV event delete failed: {exc}",
+        ) from exc
+    return {"deleted": True, "uid": uid}
 
 
 def list_synology_calendar_events(start: str, end: str) -> list[dict]:
@@ -1432,6 +1496,18 @@ def get_calendar_events(start: str, end: str):
 @app.post("/api/calendar/events")
 def create_calendar_event(event: CalendarEventCreate):
     return create_synology_calendar_event(event)
+
+
+@app.put("/calendar/events/{uid}")
+@app.put("/api/calendar/events/{uid}")
+def update_calendar_event(uid: str, event: CalendarEventCreate):
+    return update_synology_calendar_event(uid, event)
+
+
+@app.delete("/calendar/events/{uid}")
+@app.delete("/api/calendar/events/{uid}")
+def delete_calendar_event(uid: str):
+    return delete_synology_calendar_event(uid)
 
 
 @app.get("/schedules")
