@@ -981,6 +981,32 @@ def create_company(company: CompanyCreate):
     return result.data[0]
 
 
+@app.put("/companies/{company_id}")
+@app.put("/api/companies/{company_id}")
+def update_company(company_id: str, company: CompanyCreate):
+    try:
+        payload = {
+            key: value
+            for key, value in company.dict().items()
+            if key in company_column_names()
+        }
+        result = (
+            supabase.table("companies")
+            .update(payload)
+            .eq("id", company_id)
+            .execute()
+        )
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Company not found.")
+        return result.data[0]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Company update failed: {exc}",
+        ) from exc
+
 
 @app.delete("/companies/{company_id}")
 @app.delete("/api/companies/{company_id}")
