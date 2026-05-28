@@ -1147,12 +1147,21 @@ def delete_inspection_record(inspection_id: str):
 @app.get("/schedules")
 @app.get("/api/schedules")
 def get_schedules():
-    schedules = (
-        supabase.table("inspection_schedules")
-        .select("id, company_id, date, category, time, created_at")
-        .order("date", desc=True)
-        .execute()
-    )
+    try:
+        schedules = (
+            supabase.table("inspection_schedules")
+            .select("id, company_id, date, category, time, created_at")
+            .order("date", desc=True)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "inspection_schedules table is missing or unavailable. "
+                "Run supabase_create_inspection_schedules.sql in Supabase."
+            ),
+        ) from exc
     rows = schedules.data or []
     company_ids = list({row.get("company_id") for row in rows if row.get("company_id")})
 
@@ -1178,7 +1187,16 @@ def get_schedules():
 @app.post("/api/schedules")
 def create_schedule(schedule: InspectionScheduleCreate):
     payload = schedule_payload_from_create(schedule)
-    result = supabase.table("inspection_schedules").insert(payload).execute()
+    try:
+        result = supabase.table("inspection_schedules").insert(payload).execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "inspection_schedules table is missing or unavailable. "
+                "Run supabase_create_inspection_schedules.sql in Supabase."
+            ),
+        ) from exc
     return result.data[0]
 
 
@@ -1186,12 +1204,21 @@ def create_schedule(schedule: InspectionScheduleCreate):
 @app.put("/api/schedules/{schedule_id}")
 def update_schedule(schedule_id: str, schedule: InspectionScheduleCreate):
     payload = schedule_payload_from_create(schedule)
-    result = (
-        supabase.table("inspection_schedules")
-        .update(payload)
-        .eq("id", schedule_id)
-        .execute()
-    )
+    try:
+        result = (
+            supabase.table("inspection_schedules")
+            .update(payload)
+            .eq("id", schedule_id)
+            .execute()
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "inspection_schedules table is missing or unavailable. "
+                "Run supabase_create_inspection_schedules.sql in Supabase."
+            ),
+        ) from exc
     if not result.data:
         raise HTTPException(status_code=404, detail="Schedule not found.")
     return result.data[0]
@@ -1200,7 +1227,16 @@ def update_schedule(schedule_id: str, schedule: InspectionScheduleCreate):
 @app.delete("/schedules/{schedule_id}")
 @app.delete("/api/schedules/{schedule_id}")
 def delete_schedule(schedule_id: str):
-    supabase.table("inspection_schedules").delete().eq("id", schedule_id).execute()
+    try:
+        supabase.table("inspection_schedules").delete().eq("id", schedule_id).execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "inspection_schedules table is missing or unavailable. "
+                "Run supabase_create_inspection_schedules.sql in Supabase."
+            ),
+        ) from exc
     return {"deleted": True, "id": schedule_id}
 
 
