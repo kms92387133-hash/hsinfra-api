@@ -1040,6 +1040,12 @@ def format_ics_datetime(value: datetime) -> str:
     return value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
+def format_ics_datetime_line(name: str, value: datetime) -> str:
+    if value.tzinfo is None:
+        return f"{name};TZID=Asia/Seoul:{format_ics_datetime(value)}"
+    return f"{name}:{format_ics_datetime(value)}"
+
+
 def escape_ics_text(value: str) -> str:
     return (
         value.replace("\\", "\\\\")
@@ -1102,7 +1108,7 @@ def create_synology_calendar_event(event: CalendarEventCreate) -> dict:
     title = event.title.strip() or event.company_name.strip() or "일정"
     description = event.memo.strip()
     if event.company_name.strip():
-        description = f"업체명: {event.company_name.strip()}\\n{description}".strip()
+        description = f"업체명: {event.company_name.strip()}\n{description}".strip()
 
     ics = "\r\n".join(
         [
@@ -1112,8 +1118,8 @@ def create_synology_calendar_event(event: CalendarEventCreate) -> dict:
             "BEGIN:VEVENT",
             f"UID:{uid}",
             f"DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
-            f"DTSTART:{format_ics_datetime(start_at)}",
-            f"DTEND:{format_ics_datetime(end_at)}",
+            format_ics_datetime_line("DTSTART", start_at),
+            format_ics_datetime_line("DTEND", end_at),
             f"SUMMARY:{escape_ics_text(title)}",
             f"DESCRIPTION:{escape_ics_text(description)}",
             "END:VEVENT",
