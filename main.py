@@ -1162,6 +1162,11 @@ def unfold_ics(data: str) -> str:
     return re.sub(r"\r?\n[ \t]", "", data or "")
 
 
+def vevent_ics(data: str) -> str:
+    match = re.search(r"BEGIN:VEVENT\r?\n(.*?)\r?\nEND:VEVENT", data or "", re.DOTALL)
+    return match.group(1) if match else data
+
+
 def ics_field(data: str, name: str) -> str:
     match = re.search(rf"^{name}(?:;[^:]*)?:(.*)$", data, re.MULTILINE)
     return match.group(1).strip() if match else ""
@@ -1267,7 +1272,7 @@ def calendar_event_object(uid: str):
 
 
 def calendar_event_to_json(event) -> dict:
-    data = unfold_ics(getattr(event, "data", "") or "")
+    data = vevent_ics(unfold_ics(getattr(event, "data", "") or ""))
     memo = ics_field(data, "DESCRIPTION").replace("\\n", "\n")
     company_name = ""
     for line in memo.splitlines():
