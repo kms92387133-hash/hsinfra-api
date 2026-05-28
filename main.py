@@ -1231,23 +1231,35 @@ def company_address_for_calendar(company_name: str) -> str:
     return ""
 
 
-def company_name_if_exists(value: str) -> str:
+def calendar_title_company_candidates(value: str) -> list[str]:
     target = value.strip()
     if not target:
-        return ""
-    try:
-        result = (
-            supabase.table("companies")
-            .select("company_name")
-            .eq("company_name", target)
-            .limit(1)
-            .execute()
-        )
-        rows = result.data or []
-        if rows:
-            return (rows[0].get("company_name") or "").strip()
-    except Exception:
-        return ""
+        return []
+    candidates = [target]
+    completed_prefixes = ["완)", "완）"]
+    for prefix in completed_prefixes:
+        if target.startswith(prefix):
+            cleaned = target[len(prefix):].strip()
+            if cleaned and cleaned not in candidates:
+                candidates.append(cleaned)
+    return candidates
+
+
+def company_name_if_exists(value: str) -> str:
+    for target in calendar_title_company_candidates(value):
+        try:
+            result = (
+                supabase.table("companies")
+                .select("company_name")
+                .eq("company_name", target)
+                .limit(1)
+                .execute()
+            )
+            rows = result.data or []
+            if rows:
+                return (rows[0].get("company_name") or "").strip()
+        except Exception:
+            return ""
     return ""
 
 
