@@ -85,6 +85,7 @@ class CalendarEventCreate(BaseModel):
     memo: str = ""
     location: str = ""
     inspector: str = ""
+    all_day: bool = False
 
 
 def clean_path_segment(value: str) -> str:
@@ -1144,6 +1145,10 @@ def format_ics_datetime_line(name: str, value: datetime) -> str:
     return f"{name}:{format_ics_datetime(value)}"
 
 
+def format_ics_date_line(name: str, value: datetime) -> str:
+    return f"{name};VALUE=DATE:{value.strftime('%Y%m%d')}"
+
+
 def escape_ics_text(value: str) -> str:
     return (
         value.replace("\\", "\\\\")
@@ -1175,6 +1180,10 @@ def parse_ics_datetime(value: str) -> str:
         return datetime.strptime(raw[:8], "%Y%m%d").date().isoformat()
     except Exception:
         return raw
+
+
+def is_ics_all_day(data: str) -> bool:
+    return bool(re.search(r"^DTSTART(?:;[^:]*)?VALUE=DATE(?:;[^:]*)?:", data, re.MULTILINE))
 
 
 def company_address_for_calendar(company_name: str) -> str:
@@ -1275,6 +1284,7 @@ def calendar_event_to_json(event) -> dict:
         "memo": memo,
         "location": ics_field(data, "LOCATION"),
         "inspector": parse_attendee_names(data),
+        "all_day": is_ics_all_day(data),
         "start_at": parse_ics_datetime(ics_field(data, "DTSTART")),
         "end_at": parse_ics_datetime(ics_field(data, "DTEND")),
     }
@@ -1287,7 +1297,12 @@ def create_synology_calendar_event(
     calendar = synology_calendar()
     start_at = parse_event_datetime(event.start_at)
     end_at = parse_event_datetime(event.end_at)
-    if end_at <= start_at:
+    if event.all_day:
+        start_at = datetime(start_at.year, start_at.month, start_at.day)
+        end_at = datetime(end_at.year, end_at.month, end_at.day)
+        if end_at <= start_at:
+            end_at = start_at + timedelta(days=1)
+    elif end_at <= start_at:
         raise HTTPException(status_code=400, detail="end_at must be after start_at.")
 
     uid = uid_override or f"{uuid.uuid4()}@hsinfra"
@@ -1307,8 +1322,16 @@ def create_synology_calendar_event(
             "BEGIN:VEVENT",
             f"UID:{uid}",
             f"DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
-            format_ics_datetime_line("DTSTART", start_at),
-            format_ics_datetime_line("DTEND", end_at),
+            (
+                format_ics_date_line("DTSTART", start_at)
+                if event.all_day
+                else format_ics_datetime_line("DTSTART", start_at)
+            ),
+            (
+                format_ics_date_line("DTEND", end_at)
+                if event.all_day
+                else format_ics_datetime_line("DTEND", end_at)
+            ),
             f"SUMMARY:{escape_ics_text(title)}",
             f"DESCRIPTION:{escape_ics_text(description)}",
             *([f"LOCATION:{escape_ics_text(location)}"] if location else []),
@@ -1335,6 +1358,7 @@ def create_synology_calendar_event(
         "end_at": end_at.isoformat(),
         "location": location,
         "inspector": event.inspector.strip(),
+        "all_day": event.all_day,
         "url": str(getattr(saved, "url", "")),
     }
 
