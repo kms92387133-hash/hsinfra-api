@@ -1141,7 +1141,7 @@ def upload_inspection(inspection: InspectionUpload):
 
         inserted_photo = (
             supabase.table("inspection_photos")
-            .insert(
+            .upsert(
                 {
                     "inspection_id": inspection_id,
                     "facility_name": photo.facility_name,
@@ -1150,7 +1150,8 @@ def upload_inspection(inspection: InspectionUpload):
                     "storage_path": nas_path,
                     "sort_order": photo.sort_order,
                     "uploaded_to_nas": True,
-                }
+                },
+                on_conflict="inspection_id,facility_name,sort_order",
             )
             .execute()
         )
