@@ -11,7 +11,7 @@ import zipfile
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from supabase import create_client
@@ -1174,4 +1174,75 @@ def upload_inspection(inspection: InspectionUpload):
         "inspection_id": inspection_id,
         "uploaded_photo_count": uploaded_count,
         "uploaded_photos": uploaded_photos,
+    }
+
+
+@app.post("/inspections/upload-photo")
+@app.post("/api/inspections/upload-photo")
+async def upload_inspection_photo(
+    inspection_id: str = Form(""),
+    company_name: str = Form(...),
+    date: str = Form(...),
+    category: str = Form(...),
+    facility_name: str = Form(...),
+    photo_title: str = Form(...),
+    file_name: str = Form(...),
+    sort_order: int = Form(0),
+    file: UploadFile = File(...),
+):
+    company_name = company_name.strip()
+    if not company_name:
+        raise HTTPException(status_code=400, detail="company_name is required.")
+
+    get_filestation_config()
+    company_id = ensure_company(company_name)
+    upload = InspectionUpload(
+        inspection_id=inspection_id,
+        company_name=company_name,
+        date=date,
+        category=category,
+        photos=[],
+    )
+    saved_inspection_id = create_inspection(company_id, upload)
+    content = await file.read()
+
+    nas_path = upload_photo_to_nas(
+        company_name=company_name,
+        date=date,
+        category=category,
+        file_name=file_name,
+        content=content,
+    )
+
+    inserted_photo = (
+        supabase.table("inspection_photos")
+        .upsert(
+            {
+                "inspection_id": saved_inspection_id,
+                "facility_name": facility_name,
+                "photo_title": photo_title,
+                "file_name": file_name,
+                "storage_path": nas_path,
+                "sort_order": sort_order,
+                "uploaded_to_nas": True,
+            },
+            on_conflict="inspection_id,facility_name,sort_order",
+        )
+        .execute()
+    )
+    photo_row = inserted_photo.data[0] if inserted_photo.data else {}
+    return {
+        "company_id": company_id,
+        "inspection_id": saved_inspection_id,
+        "uploaded_photo_count": 1,
+        "uploaded_photos": [
+            {
+                "id": str(photo_row.get("id", "")),
+                "facility_name": facility_name,
+                "photo_title": photo_title,
+                "file_name": file_name,
+                "storage_path": nas_path,
+                "sort_order": sort_order,
+            }
+        ],
     }
