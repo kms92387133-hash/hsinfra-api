@@ -95,6 +95,31 @@ def clean_path_segment(value: str) -> str:
     return cleaned or "_"
 
 
+def normalize_company_key(value: str) -> str:
+    key = value.strip().lower()
+    key = key.replace("㈜", "")
+    key = key.replace("(주)", "")
+    key = key.replace("（주）", "")
+    key = key.replace("주식회사", "")
+    key = re.sub(r"\s+", "", key)
+    return key
+
+
+def resolve_company_name_from_nas(value: str) -> str:
+    target_key = normalize_company_key(value)
+    if not target_key:
+        return value.strip()
+    try:
+        companies = supabase.table("companies").select("company_name").execute()
+        for company in companies.data or []:
+            company_name = (company.get("company_name") or "").strip()
+            if normalize_company_key(company_name) == target_key:
+                return company_name
+    except Exception:
+        return value.strip()
+    return value.strip()
+
+
 def compact_date(value: str) -> str:
     digits = "".join(ch for ch in value if ch.isdigit())
     return digits[:8] if len(digits) >= 8 else clean_path_segment(value)
@@ -798,6 +823,148 @@ def download_photo_from_filestation(storage_path: str) -> bytes:
         return response.content
     finally:
         filestation_logout(base_url, sid)
+
+
+
+def filestation_list(path: str) -> list[dict]:
+    base_url, sid = filestation_login()
+    try:
+        response = requests.get(
+            f"{base_url}/webapi/entry.cgi",
+            params={
+                "api": "SYNO.FileStation.List",
+                "version": "2",
+                "method": "list",
+                "folder_path": path,
+                "additional": "real_path,size,time",
+                "_sid": sid,
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("success"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"NAS File Station list failed: {payload}",
+            )
+        return payload.get("data", {}).get("files", []) or []
+    finally:
+        filestation_logout(base_url, sid)
+
+
+def parse_inspection_folder_name(name: str) -> dict | None:
+    match = re.match(r"^(\d{8})\s+\(([^)]+)\)\s+(.+)$", name.strip())
+    if not match:
+        return None
+    raw_date, category, company_name = match.groups()
+    return {
+        "date": f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}",
+        "category": category.strip(),
+        "company_name": resolve_company_name_from_nas(company_name.strip()),
+    }
+
+
+def parse_nas_photo_file_name(file_name: str, fallback_order: int) -> dict | None:
+    if not re.search(r"\.(jpg|jpeg|png)$", file_name, re.IGNORECASE):
+        return None
+    stem = re.sub(r"\.(jpg|jpeg|png)$", "", file_name, flags=re.IGNORECASE)
+    match = re.match(r"^(\d+)\s*-\s*(.+?)\s*-\s*(.+)$", stem)
+    if match:
+        facility_no, facility_name, photo_title = match.groups()
+        title_match = re.search(r"(\d+)$", photo_title.strip())
+        sort_order = int(title_match.group(1)) - 1 if title_match else fallback_order
+        return {
+            "facility_name": facility_name.strip(),
+            "photo_title": photo_title.strip(),
+            "sort_order": max(sort_order, 0),
+        }
+    return {
+        "facility_name": "기타",
+        "photo_title": stem.strip() or file_name,
+        "sort_order": fallback_order,
+    }
+
+
+def ensure_inspection_for_nas_folder(company_name: str, date: str, category: str) -> str:
+    company_id = ensure_company(company_name)
+    existing = (
+        supabase.table("inspections")
+        .select("id")
+        .eq("company_id", company_id)
+        .eq("date", date)
+        .eq("category", category)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        return str(existing.data[0]["id"])
+    inserted = (
+        supabase.table("inspections")
+        .insert({"company_id": company_id, "date": date, "category": category})
+        .execute()
+    )
+    return str(inserted.data[0]["id"])
+
+
+def sync_nas_photo_metadata() -> dict:
+    _, _, _, root_path = get_filestation_config()
+    folders = [item for item in filestation_list(root_path) if item.get("isdir")]
+    synced_folders = 0
+    synced_photos = 0
+    skipped_files = 0
+
+    for folder in folders:
+        folder_name = (folder.get("name") or "").strip()
+        folder_info = parse_inspection_folder_name(folder_name)
+        if folder_info is None:
+            continue
+
+        folder_path = folder.get("path") or f"{root_path}/{folder_name}"
+        inspection_id = ensure_inspection_for_nas_folder(
+            folder_info["company_name"],
+            folder_info["date"],
+            folder_info["category"],
+        )
+        files = [item for item in filestation_list(folder_path) if not item.get("isdir")]
+        fallback_order_by_facility: dict[str, int] = {}
+
+        for file in files:
+            file_name = (file.get("name") or "").strip()
+            parsed = parse_nas_photo_file_name(
+                file_name,
+                fallback_order_by_facility.get("기타", 0),
+            )
+            if parsed is None:
+                skipped_files += 1
+                continue
+            facility_name = parsed["facility_name"]
+            if parsed["sort_order"] == fallback_order_by_facility.get("기타", 0):
+                parsed["sort_order"] = fallback_order_by_facility.get(facility_name, 0)
+            fallback_order_by_facility[facility_name] = parsed["sort_order"] + 1
+
+            storage_path = file.get("path") or f"{folder_path}/{file_name}"
+            supabase.table("inspection_photos").upsert(
+                {
+                    "inspection_id": inspection_id,
+                    "facility_name": facility_name,
+                    "photo_title": parsed["photo_title"],
+                    "file_name": file_name,
+                    "storage_path": storage_path,
+                    "sort_order": parsed["sort_order"],
+                    "uploaded_to_nas": True,
+                },
+                on_conflict="inspection_id,facility_name,sort_order",
+            ).execute()
+            synced_photos += 1
+
+        synced_folders += 1
+
+    return {
+        "synced_folders": synced_folders,
+        "synced_photos": synced_photos,
+        "skipped_files": skipped_files,
+    }
 
 def webdav_url(base_url: str, relative_path: str) -> str:
     parts = [quote(part, safe="") for part in relative_path.split("/") if part]
@@ -1828,6 +1995,12 @@ def delete_schedule(schedule_id: str):
             ),
         ) from exc
     return {"deleted": True, "id": schedule_id}
+
+
+@app.post("/inspections/sync-nas-photos")
+@app.post("/api/inspections/sync-nas-photos")
+def sync_nas_photos():
+    return sync_nas_photo_metadata()
 
 
 @app.get("/inspection-photos/{photo_id}/image")
