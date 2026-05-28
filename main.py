@@ -84,6 +84,7 @@ class CalendarEventCreate(BaseModel):
     end_at: str
     memo: str = ""
     location: str = ""
+    inspector: str = ""
 
 
 def clean_path_segment(value: str) -> str:
@@ -1111,6 +1112,55 @@ def company_address_for_calendar(company_name: str) -> str:
     return ""
 
 
+def company_name_if_exists(value: str) -> str:
+    target = value.strip()
+    if not target:
+        return ""
+    try:
+        result = (
+            supabase.table("companies")
+            .select("company_name")
+            .eq("company_name", target)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if rows:
+            return (rows[0].get("company_name") or "").strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def ics_fields(data: str, name: str) -> list[str]:
+    return [
+        match.group(1).strip()
+        for match in re.finditer(rf"^{name}(?:;[^:]*)?:(.*)$", data, re.MULTILINE)
+    ]
+
+
+def parse_attendee_names(data: str) -> str:
+    values = []
+    for line in re.finditer(r"^ATTENDEE((?:;[^:]*)?):(.*)$", data, re.MULTILINE):
+        params = line.group(1)
+        address = line.group(2).strip()
+        cn_match = re.search(r";CN=([^;:]+)", params)
+        value = cn_match.group(1).strip().strip('"') if cn_match else address
+        value = value.replace("mailto:", "").strip()
+        if value and value not in values:
+            values.append(value)
+    return ", ".join(values)
+
+
+def attendee_ics_line(value: str) -> str:
+    inspector = value.strip()
+    if not inspector:
+        return ""
+    if "@" in inspector:
+        return f"ATTENDEE;CN={escape_ics_text(inspector)}:mailto:{escape_ics_text(inspector)}"
+    return f"ATTENDEE;CN={escape_ics_text(inspector)}:mailto:{quote(inspector, safe='')}@hsinfra.local"
+
+
 def calendar_event_object(uid: str):
     calendar = synology_calendar()
     try:
@@ -1130,12 +1180,16 @@ def calendar_event_to_json(event) -> dict:
         if line.startswith("업체명:"):
             company_name = line.split(":", 1)[1].strip()
             break
+    title = ics_field(data, "SUMMARY")
+    if not company_name:
+        company_name = company_name_if_exists(title)
     return {
         "uid": ics_field(data, "UID"),
         "company_name": company_name,
-        "title": ics_field(data, "SUMMARY"),
+        "title": title,
         "memo": memo,
         "location": ics_field(data, "LOCATION"),
+        "inspector": parse_attendee_names(data),
         "start_at": parse_ics_datetime(ics_field(data, "DTSTART")),
         "end_at": parse_ics_datetime(ics_field(data, "DTEND")),
     }
@@ -1158,6 +1212,7 @@ def create_synology_calendar_event(
     if company_name:
         description = f"업체명: {company_name}\n{description}".strip()
     location = event.location.strip() or company_address_for_calendar(company_name)
+    attendee_line = attendee_ics_line(event.inspector)
 
     ics = "\r\n".join(
         [
@@ -1172,6 +1227,7 @@ def create_synology_calendar_event(
             f"SUMMARY:{escape_ics_text(title)}",
             f"DESCRIPTION:{escape_ics_text(description)}",
             *([f"LOCATION:{escape_ics_text(location)}"] if location else []),
+            *([attendee_line] if attendee_line else []),
             "END:VEVENT",
             "END:VCALENDAR",
             "",
@@ -1193,6 +1249,7 @@ def create_synology_calendar_event(
         "start_at": start_at.isoformat(),
         "end_at": end_at.isoformat(),
         "location": location,
+        "inspector": event.inspector.strip(),
         "url": str(getattr(saved, "url", "")),
     }
 
