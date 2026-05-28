@@ -1214,27 +1214,69 @@ async def upload_inspection_photo(
         content=content,
     )
 
-    inserted_photo = (
-        supabase.table("inspection_photos")
-        .upsert(
-            {
-                "inspection_id": saved_inspection_id,
-                "facility_name": facility_name,
-                "photo_title": photo_title,
-                "file_name": file_name,
-                "storage_path": nas_path,
-                "sort_order": sort_order,
-                "uploaded_to_nas": True,
-            },
-            on_conflict="inspection_id,facility_name,sort_order",
+    photo_payload = {
+        "inspection_id": saved_inspection_id,
+        "facility_name": facility_name,
+        "photo_title": photo_title,
+        "file_name": file_name,
+        "storage_path": nas_path,
+        "sort_order": sort_order,
+        "uploaded_to_nas": True,
+    }
+    photo_row = {}
+    metadata_saved = False
+    metadata_error = ""
+
+    try:
+        inserted_photo = (
+            supabase.table("inspection_photos")
+            .upsert(
+                photo_payload,
+                on_conflict="inspection_id,facility_name,sort_order",
+            )
+            .execute()
         )
-        .execute()
-    )
-    photo_row = inserted_photo.data[0] if inserted_photo.data else {}
+        photo_row = inserted_photo.data[0] if inserted_photo.data else {}
+        metadata_saved = True
+    except Exception as exc:
+        metadata_error = str(exc)
+        try:
+            existing_photo = (
+                supabase.table("inspection_photos")
+                .select("id")
+                .eq("inspection_id", saved_inspection_id)
+                .eq("facility_name", facility_name)
+                .eq("sort_order", sort_order)
+                .limit(1)
+                .execute()
+            )
+            if existing_photo.data:
+                photo_id = existing_photo.data[0]["id"]
+                updated_photo = (
+                    supabase.table("inspection_photos")
+                    .update(photo_payload)
+                    .eq("id", photo_id)
+                    .execute()
+                )
+                photo_row = updated_photo.data[0] if updated_photo.data else {"id": photo_id}
+            else:
+                inserted_photo = (
+                    supabase.table("inspection_photos")
+                    .insert(photo_payload)
+                    .execute()
+                )
+                photo_row = inserted_photo.data[0] if inserted_photo.data else {}
+            metadata_saved = True
+            metadata_error = ""
+        except Exception as fallback_exc:
+            metadata_error = f"{metadata_error}; fallback failed: {fallback_exc}"
+
     return {
         "company_id": company_id,
         "inspection_id": saved_inspection_id,
         "uploaded_photo_count": 1,
+        "metadata_saved": metadata_saved,
+        "metadata_error": metadata_error,
         "uploaded_photos": [
             {
                 "id": str(photo_row.get("id", "")),
