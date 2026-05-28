@@ -954,13 +954,26 @@ def synology_calendar():
     url, username, password = caldav_config()
     try:
         client = caldav.DAVClient(url=url, username=username, password=password)
+        discovery_error = None
+        try:
+            calendars = client.principal().calendars()
+            if calendars:
+                return calendars[0]
+        except Exception as exc:
+            discovery_error = exc
+
         try:
             return client.calendar(url=url)
-        except Exception:
-            calendars = client.principal().calendars()
-            if not calendars:
-                raise HTTPException(status_code=404, detail="No CalDAV calendar found.")
-            return calendars[0]
+        except Exception as exc:
+            if discovery_error is not None:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "Synology CalDAV calendar discovery failed. "
+                        f"Principal error: {discovery_error}; calendar URL error: {exc}"
+                    ),
+                ) from exc
+            raise
     except HTTPException:
         raise
     except Exception as exc:
