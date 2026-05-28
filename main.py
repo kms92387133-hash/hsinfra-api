@@ -45,6 +45,8 @@ class CompanyCreate(BaseModel):
     building_type: str = ""
     manager: str = ""
     phone: str = ""
+    contract_manager: str = ""
+    contract_phone: str = ""
     contact_memo: str = ""
 
 
@@ -441,8 +443,10 @@ def company_rows_from_spreadsheet(xlsx_bytes: bytes) -> list[dict]:
         "address": ["주소"],
         "address_group": ["지역", "주소구분", "권역"],
         "building_type": ["건물구분", "건물유형", "구분"],
-        "manager": ["담당자", "담당자1", "관리자"],
-        "phone": ["연락처", "연락처1", "전화번호"],
+        "manager": ["실무담당자", "점검담당자", "담당자", "담당자1", "관리자"],
+        "phone": ["실무담당자연락처", "실무담당자 연락처", "연락처", "연락처1", "전화번호"],
+        "contract_manager": ["계약담당자"],
+        "contract_phone": ["계약담당자연락처", "계약담당자 연락처", "연락처2"],
     }
     fallback_columns = {
         "company_name": 2,
@@ -451,6 +455,8 @@ def company_rows_from_spreadsheet(xlsx_bytes: bytes) -> list[dict]:
         "building_type": None,
         "manager": 8,
         "phone": 9,
+        "contract_manager": None,
+        "contract_phone": None,
     }
 
     column_map = {}
@@ -483,6 +489,10 @@ def company_rows_from_spreadsheet(xlsx_bytes: bytes) -> list[dict]:
                 "building_type": building_type,
                 "manager": value_at(row, column_map["manager"]),
                 "phone": normalize_phone(value_at(row, column_map["phone"])),
+                "contract_manager": value_at(row, column_map["contract_manager"]),
+                "contract_phone": normalize_phone(
+                    value_at(row, column_map["contract_phone"])
+                ),
                 "contact_memo": contact_memo_lookup.get(company_name, ""),
             }
         )
@@ -499,6 +509,8 @@ def company_column_names() -> set[str]:
             "building_type",
             "manager",
             "phone",
+            "contract_manager",
+            "contract_phone",
         }
     return set(result.data[0].keys())
 
@@ -1434,7 +1446,7 @@ def get_companies():
     result = (
         supabase.table("companies")
         .select("*")
-        .order("created_at", desc=True)
+        .order("company_name", desc=False)
         .execute()
     )
     return result.data
