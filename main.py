@@ -1000,7 +1000,9 @@ def get_inspections():
             photos_by_inspection_id.setdefault(photo.get("inspection_id"), []).append(photo)
 
     for row in rows:
-        row["companies"] = companies_by_id.get(row.get("company_id"), {})
+        company = companies_by_id.get(row.get("company_id"), {})
+        row["companies"] = company
+        row["company_name"] = company.get("company_name", "")
         row["inspection_photos"] = photos_by_inspection_id.get(row.get("id"), [])
 
     return rows
@@ -1019,7 +1021,7 @@ def create_inspection_record(inspection: InspectionCreate):
 def update_inspection_record(inspection_id: str, inspection: InspectionCreate):
     existing = (
         supabase.table("inspections")
-        .select("id, date, category, companies(company_name)")
+        .select("id, company_id, date, category")
         .eq("id", inspection_id)
         .limit(1)
         .execute()
@@ -1028,8 +1030,18 @@ def update_inspection_record(inspection_id: str, inspection: InspectionCreate):
         raise HTTPException(status_code=404, detail="Inspection not found.")
 
     existing_row = existing.data[0]
-    existing_company = existing_row.get("companies") or {}
-    old_company_name = existing_company.get("company_name", "")
+    existing_company_id = existing_row.get("company_id")
+    old_company_name = ""
+    if existing_company_id:
+        existing_company = (
+            supabase.table("companies")
+            .select("company_name")
+            .eq("id", existing_company_id)
+            .limit(1)
+            .execute()
+        )
+        if existing_company.data:
+            old_company_name = existing_company.data[0].get("company_name", "")
     old_date = existing_row.get("date", "")
     old_category = existing_row.get("category", "")
 
@@ -1097,7 +1109,9 @@ def get_schedules():
         companies_by_id = {company["id"]: company for company in companies.data or []}
 
     for row in rows:
-        row["companies"] = companies_by_id.get(row.get("company_id"), {})
+        company = companies_by_id.get(row.get("company_id"), {})
+        row["companies"] = company
+        row["company_name"] = company.get("company_name", "")
 
     return rows
 
