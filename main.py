@@ -1274,18 +1274,6 @@ def parse_attendee_names(data: str) -> str:
             values.append(value)
     return ", ".join(values)
 
-
-def memo_lines_without_company(memo: str) -> list[str]:
-    lines = []
-    for line in (memo or "").splitlines():
-        stripped = line.strip()
-        if stripped.startswith("업체명:"):
-            continue
-        if stripped:
-            lines.append(stripped)
-    return lines
-
-
 def attendee_ics_line(value: str) -> str:
     inspector = value.strip()
     if not inspector:
@@ -1319,10 +1307,6 @@ def calendar_event_to_json(event) -> dict:
         company_name = company_name_if_exists(title)
 
     inspector = parse_attendee_names(data)
-    if not inspector:
-        memo_lines = memo_lines_without_company(memo)
-        if memo_lines and re.search(r"(담당|소장|기사|팀장|과장|부장|차장|010-|010\d)", memo_lines[0]):
-            inspector = memo_lines[0]
 
     return {
         "uid": ics_field(data, "UID"),
