@@ -953,6 +953,7 @@ def caldav_config() -> tuple[str, str, str]:
 
 def synology_calendar():
     url, username, password = caldav_config()
+    target_calendar_name = os.getenv("SYNOLOGY_CALDAV_CALENDAR_NAME", "점검").strip()
     base_url = url.rstrip("/")
     candidate_urls = []
 
@@ -962,6 +963,8 @@ def synology_calendar():
             candidate_urls.append(normalized)
 
     add_candidate(url)
+    if target_calendar_name:
+        add_candidate(f"{base_url}/{username}/{quote(target_calendar_name, safe='')}/")
     add_candidate(f"{base_url}/{username}/home/")
     add_candidate(f"{base_url}/{username}/")
 
@@ -989,9 +992,17 @@ def synology_calendar():
         try:
             calendars = client.principal().calendars()
             if calendars:
-                for cal in calendars:
-                    if str(cal.url).rstrip("/").endswith("/home"):
-                        return cal
+                if target_calendar_name:
+                    for cal in calendars:
+                        try:
+                            if getattr(cal, "name", "").strip() == target_calendar_name:
+                                return cal
+                        except Exception:
+                            pass
+                        if str(cal.url).rstrip("/").endswith(
+                            "/" + quote(target_calendar_name, safe="")
+                        ):
+                            return cal
 
                 for cal in calendars:
                     try:
