@@ -892,6 +892,21 @@ def get_companies():
     return result.data
 
 
+@app.get("/nas/check")
+@app.get("/api/nas/check")
+def check_nas_connection():
+    base_url, username, _, root_path = get_filestation_config()
+    sid_base_url, sid = filestation_login()
+    filestation_logout(sid_base_url, sid)
+    return {
+        "success": True,
+        "base_url": base_url,
+        "username": username,
+        "root_path": root_path,
+        "filestation_login": True,
+    }
+
+
 @app.post("/companies")
 @app.post("/api/companies")
 def create_company(company: CompanyCreate):
