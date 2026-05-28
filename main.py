@@ -966,17 +966,44 @@ def sync_companies_from_spreadsheet():
 @app.get("/inspections")
 @app.get("/api/inspections")
 def get_inspections():
-    result = (
+    inspections = (
         supabase.table("inspections")
-        .select(
-            "id, company_id, date, category, created_at, "
-            "companies(company_name), "
-            "inspection_photos(id, facility_name, photo_title, file_name, storage_path, sort_order, uploaded_to_nas)"
-        )
+        .select("id, company_id, date, category, created_at")
         .order("date", desc=True)
         .execute()
     )
-    return result.data
+    rows = inspections.data or []
+    company_ids = list({row.get("company_id") for row in rows if row.get("company_id")})
+    inspection_ids = list({row.get("id") for row in rows if row.get("id")})
+
+    companies_by_id = {}
+    if company_ids:
+        companies = (
+            supabase.table("companies")
+            .select("id, company_name")
+            .in_("id", company_ids)
+            .execute()
+        )
+        companies_by_id = {company["id"]: company for company in companies.data or []}
+
+    photos_by_inspection_id = {}
+    if inspection_ids:
+        photos = (
+            supabase.table("inspection_photos")
+            .select(
+                "id, inspection_id, facility_name, photo_title, file_name, storage_path, sort_order, uploaded_to_nas"
+            )
+            .in_("inspection_id", inspection_ids)
+            .execute()
+        )
+        for photo in photos.data or []:
+            photos_by_inspection_id.setdefault(photo.get("inspection_id"), []).append(photo)
+
+    for row in rows:
+        row["companies"] = companies_by_id.get(row.get("company_id"), {})
+        row["inspection_photos"] = photos_by_inspection_id.get(row.get("id"), [])
+
+    return rows
 
 
 @app.post("/inspections")
@@ -1050,15 +1077,29 @@ def delete_inspection_record(inspection_id: str):
 @app.get("/schedules")
 @app.get("/api/schedules")
 def get_schedules():
-    result = (
+    schedules = (
         supabase.table("inspection_schedules")
-        .select(
-            "id, company_id, date, category, time, created_at, companies(company_name)"
-        )
+        .select("id, company_id, date, category, time, created_at")
         .order("date", desc=True)
         .execute()
     )
-    return result.data
+    rows = schedules.data or []
+    company_ids = list({row.get("company_id") for row in rows if row.get("company_id")})
+
+    companies_by_id = {}
+    if company_ids:
+        companies = (
+            supabase.table("companies")
+            .select("id, company_name")
+            .in_("id", company_ids)
+            .execute()
+        )
+        companies_by_id = {company["id"]: company for company in companies.data or []}
+
+    for row in rows:
+        row["companies"] = companies_by_id.get(row.get("company_id"), {})
+
+    return rows
 
 
 @app.post("/schedules")
