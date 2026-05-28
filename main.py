@@ -6,7 +6,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import List
 from urllib.error import HTTPError
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urljoin
 from urllib.request import Request, build_opener, HTTPBasicAuthHandler, HTTPPasswordMgrWithDefaultRealm
 import xml.etree.ElementTree as ET
 import zipfile
@@ -952,6 +952,74 @@ def caldav_config() -> tuple[str, str, str]:
     return url, username, password
 
 
+
+def synology_calendar_by_display_name(
+    base_url: str,
+    username: str,
+    password: str,
+    calendar_name: str,
+):
+    target = calendar_name.strip()
+    if not target:
+        return None
+
+    collection_url = f"{base_url.rstrip('/')}/{username}/"
+    body = """<?xml version="1.0" encoding="utf-8" ?>
+<d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <d:displayname />
+    <d:resourcetype />
+  </d:prop>
+</d:propfind>"""
+
+    response = requests.request(
+        "PROPFIND",
+        collection_url,
+        auth=(username, password),
+        headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+        data=body.encode("utf-8"),
+        timeout=20,
+    )
+    if response.status_code not in (207, 200):
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Synology CalDAV calendar list failed: "
+                f"HTTP {response.status_code} {response.text[:300]}"
+            ),
+        )
+
+    root = ET.fromstring(response.content)
+    ns = {
+        "d": "DAV:",
+        "c": "urn:ietf:params:xml:ns:caldav",
+    }
+
+    for item in root.findall("d:response", ns):
+        href = (item.findtext("d:href", default="", namespaces=ns) or "").strip()
+        display_name = (
+            item.findtext(".//d:displayname", default="", namespaces=ns) or ""
+        ).strip()
+        resource_type = item.find(".//d:resourcetype", ns)
+        is_calendar = resource_type is not None and resource_type.find("c:calendar", ns) is not None
+        decoded_href = unquote(href).rstrip("/")
+
+        if not is_calendar:
+            continue
+        if display_name != target and not decoded_href.endswith("/" + target):
+            continue
+
+        calendar_url = urljoin(collection_url, href)
+        client = caldav.DAVClient(
+            url=calendar_url,
+            username=username,
+            password=password,
+        )
+        return client.calendar(url=calendar_url)
+
+    return None
+
+
 def synology_calendar():
     url, username, password = caldav_config()
     target_calendar_name = os.getenv("SYNOLOGY_CALDAV_CALENDAR_NAME", "점검").strip()
@@ -970,6 +1038,22 @@ def synology_calendar():
     add_candidate(f"{base_url}/{username}/")
 
     try:
+        propfind_error = None
+        if target_calendar_name:
+            try:
+                calendar = synology_calendar_by_display_name(
+                    base_url,
+                    username,
+                    password,
+                    target_calendar_name,
+                )
+                if calendar is not None:
+                    return calendar
+            except HTTPException:
+                raise
+            except Exception as exc:
+                propfind_error = exc
+
         last_candidate_error = None
         for candidate_url in candidate_urls:
             try:
@@ -1020,6 +1104,7 @@ def synology_calendar():
             status_code=502,
             detail=(
                 "Synology CalDAV calendar discovery failed. "
+                f"PROPFIND error: {propfind_error}; "
                 f"Candidate error: {last_candidate_error}; "
                 f"Principal error: {discovery_error}"
             ),
