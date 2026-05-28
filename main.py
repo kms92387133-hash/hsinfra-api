@@ -1,7 +1,9 @@
 import base64
+import uuid
 import io
 import os
 import re
+from datetime import datetime, timezone
 from typing import List
 from urllib.error import HTTPError
 from urllib.parse import quote
@@ -9,6 +11,7 @@ from urllib.request import Request, build_opener, HTTPBasicAuthHandler, HTTPPass
 import xml.etree.ElementTree as ET
 import zipfile
 
+import caldav
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
@@ -72,6 +75,14 @@ class InspectionScheduleCreate(BaseModel):
     date: str
     category: str
     time: str = ""
+
+
+class CalendarEventCreate(BaseModel):
+    company_name: str
+    title: str
+    start_at: str
+    end_at: str
+    memo: str = ""
 
 
 def clean_path_segment(value: str) -> str:
@@ -922,6 +933,179 @@ def inspection_payload_from_create(inspection: InspectionCreate) -> dict:
     }
 
 
+
+def caldav_config() -> tuple[str, str, str]:
+    url = os.getenv("SYNOLOGY_CALDAV_URL", "").strip()
+    username = os.getenv("SYNOLOGY_CALDAV_USERNAME", "").strip()
+    password = os.getenv("SYNOLOGY_CALDAV_PASSWORD", "").strip()
+    if not url or not username or not password:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Synology CalDAV config is missing. Set "
+                "SYNOLOGY_CALDAV_URL, SYNOLOGY_CALDAV_USERNAME, "
+                "and SYNOLOGY_CALDAV_PASSWORD."
+            ),
+        )
+    return url, username, password
+
+
+def synology_calendar():
+    url, username, password = caldav_config()
+    try:
+        client = caldav.DAVClient(url=url, username=username, password=password)
+        try:
+            return client.calendar(url=url)
+        except Exception:
+            calendars = client.principal().calendars()
+            if not calendars:
+                raise HTTPException(status_code=404, detail="No CalDAV calendar found.")
+            return calendars[0]
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Synology CalDAV connection failed: {exc}",
+        ) from exc
+
+
+def parse_event_datetime(value: str) -> datetime:
+    raw = value.strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Event datetime is required.")
+    try:
+        normalized = raw.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid datetime format: {value}",
+        ) from exc
+
+
+def format_ics_datetime(value: datetime) -> str:
+    if value.tzinfo is None:
+        return value.strftime("%Y%m%dT%H%M%S")
+    return value.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def escape_ics_text(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+    )
+
+
+def unfold_ics(data: str) -> str:
+    return re.sub(r"\r?\n[ \t]", "", data or "")
+
+
+def ics_field(data: str, name: str) -> str:
+    match = re.search(rf"^{name}(?:;[^:]*)?:(.*)$", data, re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def parse_ics_datetime(value: str) -> str:
+    raw = value.strip()
+    if not raw:
+        return ""
+    try:
+        if raw.endswith("Z"):
+            parsed = datetime.strptime(raw, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+            return parsed.isoformat()
+        if "T" in raw:
+            return datetime.strptime(raw[:15], "%Y%m%dT%H%M%S").isoformat()
+        return datetime.strptime(raw[:8], "%Y%m%d").date().isoformat()
+    except Exception:
+        return raw
+
+
+def calendar_event_to_json(event) -> dict:
+    data = unfold_ics(getattr(event, "data", "") or "")
+    memo = ics_field(data, "DESCRIPTION").replace("\\n", "\n")
+    company_name = ""
+    for line in memo.splitlines():
+        if line.startswith("업체명:"):
+            company_name = line.split(":", 1)[1].strip()
+            break
+    return {
+        "uid": ics_field(data, "UID"),
+        "company_name": company_name,
+        "title": ics_field(data, "SUMMARY"),
+        "memo": memo,
+        "start_at": parse_ics_datetime(ics_field(data, "DTSTART")),
+        "end_at": parse_ics_datetime(ics_field(data, "DTEND")),
+    }
+
+
+def create_synology_calendar_event(event: CalendarEventCreate) -> dict:
+    calendar = synology_calendar()
+    start_at = parse_event_datetime(event.start_at)
+    end_at = parse_event_datetime(event.end_at)
+    if end_at <= start_at:
+        raise HTTPException(status_code=400, detail="end_at must be after start_at.")
+
+    uid = f"{uuid.uuid4()}@hsinfra"
+    title = event.title.strip() or event.company_name.strip() or "일정"
+    description = event.memo.strip()
+    if event.company_name.strip():
+        description = f"업체명: {event.company_name.strip()}\\n{description}".strip()
+
+    ics = "\r\n".join(
+        [
+            "BEGIN:VCALENDAR",
+            "VERSION:2.0",
+            "PRODID:-//HS Infra Inspection App//Synology Calendar//KO",
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"DTSTAMP:{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}",
+            f"DTSTART:{format_ics_datetime(start_at)}",
+            f"DTEND:{format_ics_datetime(end_at)}",
+            f"SUMMARY:{escape_ics_text(title)}",
+            f"DESCRIPTION:{escape_ics_text(description)}",
+            "END:VEVENT",
+            "END:VCALENDAR",
+            "",
+        ]
+    )
+
+    try:
+        saved = calendar.save_event(ics)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Synology CalDAV event create failed: {exc}",
+        ) from exc
+
+    return {
+        "created": True,
+        "uid": uid,
+        "title": title,
+        "start_at": start_at.isoformat(),
+        "end_at": end_at.isoformat(),
+        "url": str(getattr(saved, "url", "")),
+    }
+
+
+def list_synology_calendar_events(start: str, end: str) -> list[dict]:
+    calendar = synology_calendar()
+    start_at = parse_event_datetime(start)
+    end_at = parse_event_datetime(end)
+    if end_at <= start_at:
+        raise HTTPException(status_code=400, detail="end must be after start.")
+    try:
+        events = calendar.date_search(start=start_at, end=end_at, expand=True)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Synology CalDAV event query failed: {exc}",
+        ) from exc
+    return [calendar_event_to_json(event) for event in events]
+
+
 def schedule_payload_from_create(schedule: InspectionScheduleCreate) -> dict:
     company_name = schedule.company_name.strip()
     if not company_name:
@@ -1170,6 +1354,19 @@ def delete_inspection_record(inspection_id: str):
     return {"deleted": True, "id": inspection_id}
 
 
+
+@app.get("/calendar/events")
+@app.get("/api/calendar/events")
+def get_calendar_events(start: str, end: str):
+    return list_synology_calendar_events(start, end)
+
+
+@app.post("/calendar/events")
+@app.post("/api/calendar/events")
+def create_calendar_event(event: CalendarEventCreate):
+    return create_synology_calendar_event(event)
+
+
 @app.get("/schedules")
 @app.get("/api/schedules")
 def get_schedules():
@@ -1185,7 +1382,8 @@ def get_schedules():
             status_code=503,
             detail=(
                 "inspection_schedules table is missing or unavailable. "
-                "Run supabase_create_inspection_schedules.sql in Supabase."
+                "Run supabase_create_inspection_schedules.sql in Supabase. "
+                f"Original error: {exc}"
             ),
         ) from exc
     rows = schedules.data or []
@@ -1220,7 +1418,8 @@ def create_schedule(schedule: InspectionScheduleCreate):
             status_code=503,
             detail=(
                 "inspection_schedules table is missing or unavailable. "
-                "Run supabase_create_inspection_schedules.sql in Supabase."
+                "Run supabase_create_inspection_schedules.sql in Supabase. "
+                f"Original error: {exc}"
             ),
         ) from exc
     return result.data[0]
@@ -1242,7 +1441,8 @@ def update_schedule(schedule_id: str, schedule: InspectionScheduleCreate):
             status_code=503,
             detail=(
                 "inspection_schedules table is missing or unavailable. "
-                "Run supabase_create_inspection_schedules.sql in Supabase."
+                "Run supabase_create_inspection_schedules.sql in Supabase. "
+                f"Original error: {exc}"
             ),
         ) from exc
     if not result.data:
@@ -1260,7 +1460,8 @@ def delete_schedule(schedule_id: str):
             status_code=503,
             detail=(
                 "inspection_schedules table is missing or unavailable. "
-                "Run supabase_create_inspection_schedules.sql in Supabase."
+                "Run supabase_create_inspection_schedules.sql in Supabase. "
+                f"Original error: {exc}"
             ),
         ) from exc
     return {"deleted": True, "id": schedule_id}
