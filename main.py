@@ -112,6 +112,10 @@ def spreadsheet_config() -> tuple[str, str, int]:
     return base_url, link_id, sheet_id
 
 
+def spreadsheet_sheet_name() -> str:
+    return os.getenv("SPREADSHEET_SHEET_NAME", "app").strip() or "app"
+
+
 def drive_login() -> tuple[str, str]:
     base_url, _, _ = spreadsheet_config()
     _, username, password, _ = get_filestation_config()
@@ -224,30 +228,87 @@ def column_index(cell_ref: str) -> int:
     return value - 1
 
 
-def read_xlsx_sheet_rows(xlsx_bytes: bytes, sheet_id: int) -> list[list[str]]:
+def xlsx_sheet_path(zip_file: zipfile.ZipFile, sheet_name: str) -> str | None:
+    workbook_ns = {
+        "m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+    }
+    rel_ns = {
+        "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+    }
+
+    workbook = ET.fromstring(zip_file.read("xl/workbook.xml"))
+    target_relation_id = None
+    for sheet in workbook.findall("m:sheets/m:sheet", workbook_ns):
+        if (sheet.get("name") or "").strip().lower() == sheet_name.strip().lower():
+            target_relation_id = sheet.get(f"{{{workbook_ns['r']}}}id")
+            break
+
+    if not target_relation_id:
+        return None
+
+    relationships = ET.fromstring(zip_file.read("xl/_rels/workbook.xml.rels"))
+    for relationship in relationships.findall("rel:Relationship", rel_ns):
+        if relationship.get("Id") != target_relation_id:
+            continue
+        target = relationship.get("Target", "")
+        if target.startswith("/"):
+            return target.lstrip("/")
+        if target.startswith("xl/"):
+            return target
+        return f"xl/{target}"
+
+    return None
+
+
+def read_xlsx_rows_from_path(
+    zip_file: zipfile.ZipFile,
+    sheet_path: str,
+    shared_strings: list[str],
+) -> list[list[str]]:
     ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    root = ET.fromstring(zip_file.read(sheet_path))
+    rows = []
+    for row in root.findall(".//m:row", ns):
+        values: dict[int, str] = {}
+        for cell in row.findall("m:c", ns):
+            ref = cell.get("r", "A1")
+            value_node = cell.find("m:v", ns)
+            value = ""
+            if value_node is not None:
+                value = value_node.text or ""
+                if cell.get("t") == "s":
+                    value = shared_strings[int(value)]
+            inline_node = cell.find("m:is/m:t", ns)
+            if inline_node is not None:
+                value = inline_node.text or ""
+            values[column_index(ref)] = value.strip()
+        if values:
+            max_col = max(values)
+            rows.append([values.get(index, "") for index in range(max_col + 1)])
+    return rows
+
+
+def read_xlsx_sheet_rows(xlsx_bytes: bytes, sheet_id: int) -> list[list[str]]:
     with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as zip_file:
         shared_strings = xlsx_shared_strings(zip_file)
-        root = ET.fromstring(zip_file.read(f"xl/worksheets/sheet{sheet_id}.xml"))
-        rows = []
-        for row in root.findall(".//m:row", ns):
-            values: dict[int, str] = {}
-            for cell in row.findall("m:c", ns):
-                ref = cell.get("r", "A1")
-                value_node = cell.find("m:v", ns)
-                value = ""
-                if value_node is not None:
-                    value = value_node.text or ""
-                    if cell.get("t") == "s":
-                        value = shared_strings[int(value)]
-                inline_node = cell.find("m:is/m:t", ns)
-                if inline_node is not None:
-                    value = inline_node.text or ""
-                values[column_index(ref)] = value.strip()
-            if values:
-                max_col = max(values)
-                rows.append([values.get(index, "") for index in range(max_col + 1)])
-        return rows
+        return read_xlsx_rows_from_path(
+            zip_file,
+            f"xl/worksheets/sheet{sheet_id}.xml",
+            shared_strings,
+        )
+
+
+def read_xlsx_sheet_rows_by_name(xlsx_bytes: bytes, sheet_name: str) -> list[list[str]]:
+    with zipfile.ZipFile(io.BytesIO(xlsx_bytes)) as zip_file:
+        sheet_path = xlsx_sheet_path(zip_file, sheet_name)
+        if not sheet_path:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Spreadsheet sheet '{sheet_name}' was not found.",
+            )
+        shared_strings = xlsx_shared_strings(zip_file)
+        return read_xlsx_rows_from_path(zip_file, sheet_path, shared_strings)
 
 
 def value_at(row: list[str], index: int | None) -> str:
@@ -269,22 +330,21 @@ def find_header_index(headers: list[str], aliases: list[str]) -> int | None:
 
 def building_type_lookup_from_spreadsheet(xlsx_bytes: bytes) -> dict[str, str]:
     lookup = {}
-    for sheet_id in (1, 2):
-        rows = read_xlsx_sheet_rows(xlsx_bytes, sheet_id)
-        if not rows:
-            continue
+    rows = read_xlsx_sheet_rows_by_name(xlsx_bytes, spreadsheet_sheet_name())
+    if not rows:
+        return lookup
 
-        company_index = find_header_index(rows[0], ["업체명", "회사명", "업체", "회사"])
-        building_type_index = find_header_index(rows[0], ["건물유형", "건물구분"])
+    company_index = find_header_index(rows[0], ["업체명", "회사명", "업체", "회사"])
+    building_type_index = find_header_index(rows[0], ["건물유형", "건물구분"])
 
-        if company_index is None or building_type_index is None:
-            continue
+    if company_index is None or building_type_index is None:
+        return lookup
 
-        for row in rows[1:]:
-            company_name = value_at(row, company_index)
-            building_type = value_at(row, building_type_index)
-            if company_name and building_type:
-                lookup[company_name] = building_type
+    for row in rows[1:]:
+        company_name = value_at(row, company_index)
+        building_type = value_at(row, building_type_index)
+        if company_name and building_type:
+            lookup[company_name] = building_type
 
     return lookup
 
@@ -320,46 +380,44 @@ def append_contact(
 
 def contact_memo_lookup_from_spreadsheet(xlsx_bytes: bytes) -> dict[str, str]:
     lookup = {}
-    for sheet_id in (1, 2):
-        rows = read_xlsx_sheet_rows(xlsx_bytes, sheet_id)
-        if not rows:
+    rows = read_xlsx_sheet_rows_by_name(xlsx_bytes, spreadsheet_sheet_name())
+    if not rows:
+        return lookup
+
+    headers = rows[0]
+    company_index = find_header_index(headers, ["업체명", "회사명", "업체", "회사"])
+    contract_manager_index = find_header_index(headers, ["계약담당자"])
+    note_index = find_header_index(headers, ["특이사항/ 3일전협의", "특이사항", "메모"])
+
+    if company_index is None:
+        return lookup
+
+    for row in rows[1:]:
+        company_name = value_at(row, company_index)
+        if not company_name:
             continue
 
-        headers = rows[0]
-        company_index = find_header_index(headers, ["업체명", "회사명", "업체", "회사"])
-        contract_manager_index = find_header_index(headers, ["계약담당자"])
-        note_index = find_header_index(headers, ["특이사항/ 3일전협의", "특이사항", "메모"])
+        contacts = []
+        seen = set()
+        append_contact(
+            contacts,
+            seen,
+            label="담당자",
+            name=value_at(row, contract_manager_index),
+        )
 
-        if company_index is None:
-            continue
+        note = value_at(row, note_index)
+        if note:
+            contacts.append(f"메모: {note}")
 
-        for row in rows[1:]:
-            company_name = value_at(row, company_index)
-            if not company_name:
-                continue
-
-            contacts = []
-            seen = set()
-            append_contact(
-                contacts,
-                seen,
-                label="담당자",
-                name=value_at(row, contract_manager_index),
-            )
-
-            note = value_at(row, note_index)
-            if note:
-                contacts.append(f"메모: {note}")
-
-            if contacts:
-                lookup[company_name] = "\n".join(contacts)
+        if contacts:
+            lookup[company_name] = "\n".join(contacts)
 
     return lookup
 
 
 def company_rows_from_spreadsheet(xlsx_bytes: bytes) -> list[dict]:
-    _, _, sheet_id = spreadsheet_config()
-    rows = read_xlsx_sheet_rows(xlsx_bytes, sheet_id)
+    rows = read_xlsx_sheet_rows_by_name(xlsx_bytes, spreadsheet_sheet_name())
     if not rows:
         return []
 
