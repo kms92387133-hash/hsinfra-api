@@ -3,7 +3,7 @@ import uuid
 import io
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List
 from urllib.error import HTTPError
 from urllib.parse import quote
@@ -952,38 +952,53 @@ def caldav_config() -> tuple[str, str, str]:
 
 def synology_calendar():
     url, username, password = caldav_config()
-    try:
-        client = caldav.DAVClient(url=url, username=username, password=password)
-        
-        # 1. URL이 특정 캘린더를 직접 가리키는 경우를 테스트
-        # 사용자가 캘린더 고유 주소를 직접 입력했을 경우를 우선 처리합니다.
-        if not url.rstrip('/').endswith(username):
-            try:
-                cal = client.calendar(url=url)
-                _ = cal.name  # 캘린더 속성을 조회하여 유효한 캘린더인지 검증
-                return cal
-            except Exception:
-                pass
+    base_url = url.rstrip("/")
+    candidate_urls = []
 
+    def add_candidate(candidate: str):
+        normalized = candidate.rstrip("/") + "/"
+        if normalized not in candidate_urls:
+            candidate_urls.append(normalized)
+
+    add_candidate(url)
+    add_candidate(f"{base_url}/{username}/home/")
+    add_candidate(f"{base_url}/{username}/")
+
+    try:
+        last_candidate_error = None
+        for candidate_url in candidate_urls:
+            try:
+                candidate_client = caldav.DAVClient(
+                    url=candidate_url,
+                    username=username,
+                    password=password,
+                )
+                calendar = candidate_client.calendar(url=candidate_url)
+                probe_start = datetime.now()
+                calendar.date_search(
+                    start=probe_start,
+                    end=probe_start + timedelta(seconds=1),
+                )
+                return calendar
+            except Exception as exc:
+                last_candidate_error = f"{candidate_url}: {exc}"
+
+        client = caldav.DAVClient(url=url, username=username, password=password)
         discovery_error = None
-        # 2. Principal(사용자 계정)을 통해 캘린더 목록을 조회
         try:
             calendars = client.principal().calendars()
             if calendars:
-                # Synology Calendar의 기본 캘린더는 URL이 '/home'으로 끝납니다.
                 for cal in calendars:
-                    if str(cal.url).rstrip('/').endswith('/home'):
+                    if str(cal.url).rstrip("/").endswith("/home"):
                         return cal
-                
-                # 기본 캘린더가 없으면, VEVENT(일정)를 지원하는 첫 번째 캘린더를 반환합니다.
+
                 for cal in calendars:
                     try:
-                        if 'VEVENT' in cal.get_supported_components():
+                        if "VEVENT" in cal.get_supported_components():
                             return cal
                     except Exception:
                         pass
-                
-                # 적절한 것을 찾지 못했다면 첫 번째 캘린더를 기본으로 반환합니다.
+
                 return calendars[0]
         except Exception as exc:
             discovery_error = exc
@@ -992,6 +1007,7 @@ def synology_calendar():
             status_code=502,
             detail=(
                 "Synology CalDAV calendar discovery failed. "
+                f"Candidate error: {last_candidate_error}; "
                 f"Principal error: {discovery_error}"
             ),
         )
