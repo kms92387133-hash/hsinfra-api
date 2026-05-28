@@ -1184,6 +1184,14 @@ def ics_field(data: str, name: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+def unescape_ics_text(value: str) -> str:
+    result = value or ""
+    result = result.replace("\\n", "\n").replace("\\N", "\n")
+    result = result.replace("\\,", ",").replace("\\;", ";")
+    result = result.replace("\\\\", "\\")
+    return result.strip()
+
+
 def parse_ics_datetime(value: str) -> str:
     raw = value.strip()
     if not raw:
@@ -1255,12 +1263,27 @@ def parse_attendee_names(data: str) -> str:
     for line in re.finditer(r"^ATTENDEE((?:;[^:]*)?):(.*)$", data, re.MULTILINE):
         params = line.group(1)
         address = line.group(2).strip()
-        cn_match = re.search(r";CN=([^;:]+)", params)
-        value = cn_match.group(1).strip().strip('"') if cn_match else address
-        value = value.replace("mailto:", "").strip()
+        cn_match = re.search(r";CN=(?:\"([^\"]+)\"|([^;:]+))", params)
+        value = (
+            cn_match.group(1) or cn_match.group(2)
+            if cn_match
+            else address
+        )
+        value = unescape_ics_text(value).replace("mailto:", "").strip()
         if value and value not in values:
             values.append(value)
     return ", ".join(values)
+
+
+def memo_lines_without_company(memo: str) -> list[str]:
+    lines = []
+    for line in (memo or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("업체명:"):
+            continue
+        if stripped:
+            lines.append(stripped)
+    return lines
 
 
 def attendee_ics_line(value: str) -> str:
@@ -1285,22 +1308,29 @@ def calendar_event_object(uid: str):
 
 def calendar_event_to_json(event) -> dict:
     data = vevent_ics(unfold_ics(getattr(event, "data", "") or ""))
-    memo = ics_field(data, "DESCRIPTION").replace("\\n", "\n")
+    memo = unescape_ics_text(ics_field(data, "DESCRIPTION"))
     company_name = ""
     for line in memo.splitlines():
-        if line.startswith("업체명:"):
+        if line.strip().startswith("업체명:"):
             company_name = line.split(":", 1)[1].strip()
             break
-    title = ics_field(data, "SUMMARY")
+    title = unescape_ics_text(ics_field(data, "SUMMARY"))
     if not company_name:
         company_name = company_name_if_exists(title)
+
+    inspector = parse_attendee_names(data)
+    if not inspector:
+        memo_lines = memo_lines_without_company(memo)
+        if memo_lines and re.search(r"(담당|소장|기사|팀장|과장|부장|차장|010-|010\d)", memo_lines[0]):
+            inspector = memo_lines[0]
+
     return {
         "uid": ics_field(data, "UID"),
         "company_name": company_name,
         "title": title,
         "memo": memo,
-        "location": ics_field(data, "LOCATION"),
-        "inspector": parse_attendee_names(data),
+        "location": unescape_ics_text(ics_field(data, "LOCATION")),
+        "inspector": inspector,
         "all_day": is_ics_all_day(data),
         "start_at": parse_ics_datetime(ics_field(data, "DTSTART")),
         "end_at": parse_ics_datetime(ics_field(data, "DTEND")),
