@@ -112,6 +112,7 @@ class CalendarEventCreate(BaseModel):
     inspector: str = ""
     inspectors: List[CalendarInspector] = Field(default_factory=list)
     all_day: bool = False
+    calendar_scope: str = "shared"
 
 
 def clean_path_segment(value: str) -> str:
@@ -1391,6 +1392,161 @@ def synology_calendar_by_display_name(
     return None
 
 
+
+def configured_shared_calendar_names() -> set[str]:
+    raw = os.getenv(
+        "SYNOLOGY_CALDAV_SHARED_NAMES",
+        os.getenv("SYNOLOGY_CALDAV_SHARED_NAME", os.getenv("SYNOLOGY_CALDAV_CALENDAR_NAME", "점검")),
+    )
+    names = {item.strip() for item in raw.split(",") if item.strip()}
+    names.add("점검")
+    return names
+
+
+def configured_personal_calendar_names() -> set[str]:
+    raw = os.getenv("SYNOLOGY_CALDAV_PERSONAL_NAMES", "My Calendar,home")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def calendar_display_name(calendar) -> str:
+    for attr in ("name", "display_name"):
+        try:
+            value = getattr(calendar, attr, "")
+            if callable(value):
+                value = value()
+            value = str(value or "").strip()
+            if value:
+                return value
+        except Exception:
+            pass
+    url_tail = unquote(str(getattr(calendar, "url", "")).rstrip("/").split("/")[-1])
+    return url_tail or "Calendar"
+
+
+def calendar_scope_for(name: str, url: str) -> str:
+    decoded_url = unquote(url).rstrip("/")
+    tail = decoded_url.split("/")[-1]
+    shared_names = configured_shared_calendar_names()
+    personal_names = configured_personal_calendar_names()
+    if name in shared_names or tail in shared_names:
+        return "shared"
+    if name in personal_names or tail in personal_names:
+        return "personal"
+    if tail == "home" or name.lower() in {"my calendar", "personal"}:
+        return "personal"
+    return "shared"
+
+
+def calendar_can_write(calendar, username: str, password: str) -> bool:
+    url = str(getattr(calendar, "url", "")).rstrip("/") + "/"
+    body = """<?xml version="1.0" encoding="utf-8" ?>
+<d:propfind xmlns:d="DAV:">
+  <d:prop>
+    <d:current-user-privilege-set />
+  </d:prop>
+</d:propfind>"""
+    try:
+        response = requests.request(
+            "PROPFIND",
+            url,
+            auth=(username, password),
+            headers={"Depth": "0", "Content-Type": "application/xml; charset=utf-8"},
+            data=body.encode("utf-8"),
+            timeout=15,
+        )
+        if response.status_code not in (207, 200):
+            return True
+        root = ET.fromstring(response.content)
+        privileges = [
+            item.tag.split("}", 1)[-1]
+            for item in root.findall(".//{DAV:}privilege/*")
+        ]
+        if not privileges:
+            return True
+        return any(item in {"write", "write-content", "bind", "unbind", "all"} for item in privileges)
+    except Exception:
+        return True
+
+
+def synology_calendar_entries() -> list[dict]:
+    url, username, password = caldav_config()
+    client = caldav.DAVClient(url=url, username=username, password=password)
+    calendars = []
+    try:
+        calendars = client.principal().calendars()
+    except Exception:
+        calendars = []
+
+    entries: list[dict] = []
+    seen_urls: set[str] = set()
+
+    for calendar in calendars:
+        calendar_url = str(getattr(calendar, "url", "")).rstrip("/") + "/"
+        if not calendar_url or calendar_url in seen_urls:
+            continue
+        try:
+            supported = calendar.get_supported_components()
+            if supported and "VEVENT" not in supported:
+                continue
+        except Exception:
+            pass
+        name = calendar_display_name(calendar)
+        entries.append(
+            {
+                "scope": calendar_scope_for(name, calendar_url),
+                "name": name,
+                "url": calendar_url,
+                "can_write": calendar_can_write(calendar, username, password),
+                "calendar": calendar,
+            }
+        )
+        seen_urls.add(calendar_url)
+
+    target_calendar_name = os.getenv("SYNOLOGY_CALDAV_CALENDAR_NAME", "점검").strip()
+    if target_calendar_name and not any(item["scope"] == "shared" for item in entries):
+        found = synology_calendar_by_display_name(url.rstrip("/"), username, password, target_calendar_name)
+        if found is not None:
+            calendar_url = str(getattr(found, "url", "")).rstrip("/") + "/"
+            if calendar_url not in seen_urls:
+                entries.append(
+                    {
+                        "scope": "shared",
+                        "name": calendar_display_name(found),
+                        "url": calendar_url,
+                        "can_write": calendar_can_write(found, username, password),
+                        "calendar": found,
+                    }
+                )
+
+    entries.sort(key=lambda item: (0 if item["scope"] == "personal" else 1, item["name"]))
+    return entries
+
+
+def public_calendar_entries() -> list[dict]:
+    return [
+        {
+            "scope": item["scope"],
+            "name": item["name"],
+            "url": item["url"],
+            "can_write": item["can_write"],
+            "read_only": not item["can_write"],
+        }
+        for item in synology_calendar_entries()
+    ]
+
+
+def calendar_entry_for_scope(scope: str) -> dict:
+    normalized = (scope or "shared").strip().lower()
+    if normalized not in {"personal", "shared"}:
+        normalized = "shared"
+    entries = synology_calendar_entries()
+    for item in entries:
+        if item["scope"] == normalized:
+            return item
+    if entries:
+        return entries[0]
+    raise HTTPException(status_code=502, detail="Synology CalDAV calendar list is empty.")
+
 def synology_calendar():
     url, username, password = caldav_config()
     target_calendar_name = os.getenv("SYNOLOGY_CALDAV_CALENDAR_NAME", "점검").strip()
@@ -1738,8 +1894,8 @@ def attendee_ics_lines(inspectors: list[dict]) -> list[str]:
     return lines
 
 
-def calendar_event_object(uid: str):
-    calendar = synology_calendar()
+def calendar_event_object(uid: str, calendar_scope: str = "shared"):
+    calendar = calendar_entry_for_scope(calendar_scope)["calendar"]
     try:
         return calendar.event_by_uid(uid)
     except Exception as exc:
@@ -1749,7 +1905,7 @@ def calendar_event_object(uid: str):
         ) from exc
 
 
-def calendar_event_to_json(event) -> dict:
+def calendar_event_to_json(event, calendar_meta: dict | None = None) -> dict:
     data = vevent_ics(unfold_ics(getattr(event, "data", "") or ""))
     memo = unescape_ics_text(ics_field(data, "DESCRIPTION"))
     company_name = ""
@@ -1766,10 +1922,15 @@ def calendar_event_to_json(event) -> dict:
     )
     inspector = ", ".join(inspector_display_name(item) for item in inspectors)
 
+    meta = calendar_meta or {}
     return {
         "uid": ics_field(data, "UID"),
         "company_name": company_name,
         "title": title,
+        "calendar_scope": meta.get("scope", "shared"),
+        "calendar_name": meta.get("name", ""),
+        "calendar_url": meta.get("url", ""),
+        "can_edit": bool(meta.get("can_write", True)),
         "memo": memo,
         "location": unescape_ics_text(ics_field(data, "LOCATION")),
         "inspector": inspector,
@@ -1783,8 +1944,16 @@ def calendar_event_to_json(event) -> dict:
 def create_synology_calendar_event(
     event: CalendarEventCreate,
     uid_override: str | None = None,
+    calendar_scope: str | None = None,
 ) -> dict:
-    calendar = synology_calendar()
+    scope = calendar_scope or event.calendar_scope or "shared"
+    entry = calendar_entry_for_scope(scope)
+    if not entry["can_write"]:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Calendar '{entry['name']}' is read-only for this account.",
+        )
+    calendar = entry["calendar"]
     start_at = parse_event_datetime(event.start_at)
     end_at = parse_event_datetime(event.end_at)
     if event.all_day:
@@ -1859,12 +2028,22 @@ def create_synology_calendar_event(
         "inspector": ", ".join(inspector_display_name(item) for item in inspectors),
         "inspectors": inspectors,
         "all_day": event.all_day,
+        "calendar_scope": entry["scope"],
+        "calendar_name": entry["name"],
+        "calendar_url": entry["url"],
+        "can_edit": entry["can_write"],
         "url": str(getattr(saved, "url", "")),
     }
 
 
 def update_synology_calendar_event(uid: str, event: CalendarEventCreate) -> dict:
-    existing = calendar_event_object(uid)
+    entry = calendar_entry_for_scope(event.calendar_scope)
+    if not entry["can_write"]:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Calendar '{entry['name']}' is read-only for this account.",
+        )
+    existing = calendar_event_object(uid, event.calendar_scope)
     try:
         existing.delete()
     except Exception as exc:
@@ -1872,11 +2051,17 @@ def update_synology_calendar_event(uid: str, event: CalendarEventCreate) -> dict
             status_code=502,
             detail=f"Synology CalDAV event delete before update failed: {exc}",
         ) from exc
-    return create_synology_calendar_event(event, uid_override=uid)
+    return create_synology_calendar_event(event, uid_override=uid, calendar_scope=event.calendar_scope)
 
 
-def delete_synology_calendar_event(uid: str) -> dict:
-    existing = calendar_event_object(uid)
+def delete_synology_calendar_event(uid: str, calendar_scope: str = "shared") -> dict:
+    entry = calendar_entry_for_scope(calendar_scope)
+    if not entry["can_write"]:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Calendar '{entry['name']}' is read-only for this account.",
+        )
+    existing = calendar_event_object(uid, calendar_scope)
     try:
         existing.delete()
     except Exception as exc:
@@ -1887,20 +2072,35 @@ def delete_synology_calendar_event(uid: str) -> dict:
     return {"deleted": True, "uid": uid}
 
 
-def list_synology_calendar_events(start: str, end: str) -> list[dict]:
-    calendar = synology_calendar()
+def list_synology_calendar_events(start: str, end: str, scopes: str = "personal,shared") -> list[dict]:
     start_at = parse_event_datetime(start)
     end_at = parse_event_datetime(end)
     if end_at <= start_at:
         raise HTTPException(status_code=400, detail="end must be after start.")
-    try:
-        events = calendar.date_search(start=start_at, end=end_at)
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Synology CalDAV event query failed: {exc}",
-        ) from exc
-    return [calendar_event_to_json(event) for event in events]
+
+    requested_scopes = {
+        item.strip().lower()
+        for item in scopes.split(",")
+        if item.strip().lower() in {"personal", "shared"}
+    }
+    if not requested_scopes:
+        requested_scopes = {"personal", "shared"}
+
+    results: list[dict] = []
+    for entry in synology_calendar_entries():
+        if entry["scope"] not in requested_scopes:
+            continue
+        try:
+            events = entry["calendar"].date_search(start=start_at, end=end_at)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Synology CalDAV event query failed ({entry['name']}): {exc}",
+            ) from exc
+        results.extend(calendar_event_to_json(event, entry) for event in events)
+
+    results.sort(key=lambda item: item.get("start_at", ""))
+    return results
 
 
 def schedule_payload_from_create(schedule: InspectionScheduleCreate) -> dict:
@@ -2169,15 +2369,34 @@ def check_calendar_connection():
     }
 
 
+@app.get("/calendar/calendars")
+@app.get("/api/calendar/calendars")
+def get_calendar_list():
+    return public_calendar_entries()
+
+
 @app.get("/calendar/events")
 @app.get("/api/calendar/events")
-def get_calendar_events(start: str, end: str):
-    return list_synology_calendar_events(start, end)
+def get_calendar_events(start: str, end: str, scopes: str = "personal,shared"):
+    return list_synology_calendar_events(start, end, scopes)
 
 
 @app.post("/calendar/events")
 @app.post("/api/calendar/events")
 def create_calendar_event(event: CalendarEventCreate):
+    scope = (event.calendar_scope or "shared").strip().lower()
+    if scope == "both":
+        created = []
+        for target_scope in ("personal", "shared"):
+            try:
+                created.append(create_synology_calendar_event(event, calendar_scope=target_scope))
+            except HTTPException as exc:
+                if target_scope == "shared" and exc.status_code == 403:
+                    continue
+                raise
+        if not created:
+            raise HTTPException(status_code=403, detail="No writable calendar was available.")
+        return {"created": True, "created_count": len(created), "events": created, **created[0]}
     return create_synology_calendar_event(event)
 
 
@@ -2189,8 +2408,8 @@ def update_calendar_event(uid: str, event: CalendarEventCreate):
 
 @app.delete("/calendar/events/{uid}")
 @app.delete("/api/calendar/events/{uid}")
-def delete_calendar_event(uid: str):
-    return delete_synology_calendar_event(uid)
+def delete_calendar_event(uid: str, calendar_scope: str = "shared"):
+    return delete_synology_calendar_event(uid, calendar_scope)
 
 
 @app.get("/schedules")
