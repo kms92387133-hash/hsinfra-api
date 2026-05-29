@@ -1369,9 +1369,9 @@ def synology_calendar_by_display_name(
 
     for item in root.findall("d:response", ns):
         href = (item.findtext("d:href", default="", namespaces=ns) or "").strip()
-        display_name = (
+        display_name = repair_mojibake_text(
             item.findtext(".//d:displayname", default="", namespaces=ns) or ""
-        ).strip()
+        )
         resource_type = item.find(".//d:resourcetype", ns)
         is_calendar = resource_type is not None and resource_type.find("c:calendar", ns) is not None
         decoded_href = unquote(href).rstrip("/")
@@ -1408,18 +1408,33 @@ def configured_personal_calendar_names() -> set[str]:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
+def repair_mojibake_text(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    try:
+        repaired = text.encode("latin1").decode("utf-8")
+        if repaired and repaired != text:
+            return repaired
+    except Exception:
+        pass
+    return text
+
+
 def calendar_display_name(calendar) -> str:
     for attr in ("name", "display_name"):
         try:
             value = getattr(calendar, attr, "")
             if callable(value):
                 value = value()
-            value = str(value or "").strip()
+            value = repair_mojibake_text(str(value or ""))
             if value:
                 return value
         except Exception:
             pass
-    url_tail = unquote(str(getattr(calendar, "url", "")).rstrip("/").split("/")[-1])
+    url_tail = repair_mojibake_text(
+        unquote(str(getattr(calendar, "url", "")).rstrip("/").split("/")[-1])
+    )
     return url_tail or "Calendar"
 
 
