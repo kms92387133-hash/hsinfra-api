@@ -112,7 +112,7 @@ class CalendarEventCreate(BaseModel):
     inspector: str = ""
     inspectors: List[CalendarInspector] = Field(default_factory=list)
     all_day: bool = False
-    calendar_scope: str = "shared"
+    calendar_scope: str = "company_shared"
 
 
 def clean_path_segment(value: str) -> str:
@@ -1438,13 +1438,24 @@ def calendar_display_name(calendar) -> str:
     return url_tail or "Calendar"
 
 
+def normalize_calendar_scope(scope: str) -> str:
+    normalized = (scope or "company_shared").strip().lower()
+    if normalized in {"shared", "company", "company_shared"}:
+        return "company_shared"
+    if normalized in {"personal", "my", "mine"}:
+        return "personal"
+    if normalized == "other":
+        return "other"
+    return "company_shared"
+
+
 def calendar_scope_for(name: str, url: str) -> str:
     decoded_url = unquote(url).rstrip("/")
     tail = decoded_url.split("/")[-1]
     shared_names = configured_shared_calendar_names()
     personal_names = configured_personal_calendar_names()
     if name in shared_names or tail in shared_names:
-        return "shared"
+        return "company_shared"
     if name in personal_names or tail in personal_names:
         return "personal"
     if tail == "home" or name.lower() in {"my calendar", "personal"}:
@@ -1507,8 +1518,6 @@ def synology_calendar_entries() -> list[dict]:
             pass
         name = calendar_display_name(calendar)
         scope = calendar_scope_for(name, calendar_url)
-        if scope == "other":
-            continue
         entries.append(
             {
                 "scope": scope,
@@ -1521,14 +1530,14 @@ def synology_calendar_entries() -> list[dict]:
         seen_urls.add(calendar_url)
 
     target_calendar_name = os.getenv("SYNOLOGY_CALDAV_CALENDAR_NAME", "점검").strip()
-    if target_calendar_name and not any(item["scope"] == "shared" for item in entries):
+    if target_calendar_name and not any(item["scope"] == "company_shared" for item in entries):
         found = synology_calendar_by_display_name(url.rstrip("/"), username, password, target_calendar_name)
         if found is not None:
             calendar_url = str(getattr(found, "url", "")).rstrip("/") + "/"
             if calendar_url not in seen_urls:
                 entries.append(
                     {
-                        "scope": "shared",
+                        "scope": "company_shared",
                         "name": calendar_display_name(found),
                         "url": calendar_url,
                         "can_write": calendar_can_write(found, username, password),
@@ -1536,7 +1545,7 @@ def synology_calendar_entries() -> list[dict]:
                     }
                 )
 
-    entries.sort(key=lambda item: (0 if item["scope"] == "personal" else 1, item["name"]))
+    entries.sort(key=lambda item: (0 if item["scope"] == "personal" else 1 if item["scope"] == "company_shared" else 2, item["name"]))
     return entries
 
 
@@ -1546,17 +1555,21 @@ def public_calendar_entries() -> list[dict]:
             "scope": item["scope"],
             "name": item["name"],
             "url": item["url"],
+            "calendarName": item["name"],
+            "calendarUrl": item["url"],
             "can_write": item["can_write"],
+            "canWrite": item["can_write"],
             "read_only": not item["can_write"],
+            "readOnly": not item["can_write"],
         }
         for item in synology_calendar_entries()
     ]
 
 
 def calendar_entry_for_scope(scope: str) -> dict:
-    normalized = (scope or "shared").strip().lower()
-    if normalized not in {"personal", "shared"}:
-        normalized = "shared"
+    normalized = normalize_calendar_scope(scope)
+    if normalized == "other":
+        normalized = "company_shared"
     entries = synology_calendar_entries()
     for item in entries:
         if item["scope"] == normalized:
@@ -1912,7 +1925,7 @@ def attendee_ics_lines(inspectors: list[dict]) -> list[str]:
     return lines
 
 
-def calendar_event_object(uid: str, calendar_scope: str = "shared"):
+def calendar_event_object(uid: str, calendar_scope: str = "company_shared"):
     calendar = calendar_entry_for_scope(calendar_scope)["calendar"]
     try:
         return calendar.event_by_uid(uid)
@@ -1955,9 +1968,12 @@ def calendar_event_to_json(event, calendar_meta: dict | None = None) -> dict:
         "uid": ics_field(data, "UID"),
         "company_name": company_name,
         "title": title,
-        "calendar_scope": meta.get("scope", "shared"),
+        "calendar_scope": meta.get("scope", "company_shared"),
+        "calendarScope": meta.get("scope", "company_shared"),
         "calendar_name": meta.get("name", ""),
+        "calendarName": meta.get("name", ""),
         "calendar_url": meta.get("url", ""),
+        "calendarUrl": meta.get("url", ""),
         "href": caldav_event_attr(event, "url"),
         "etag": caldav_event_attr(event, "etag"),
         "can_edit": bool(meta.get("can_write", True)),
@@ -1976,7 +1992,7 @@ def create_synology_calendar_event(
     uid_override: str | None = None,
     calendar_scope: str | None = None,
 ) -> dict:
-    scope = calendar_scope or event.calendar_scope or "shared"
+    scope = normalize_calendar_scope(calendar_scope or event.calendar_scope or "company_shared")
     entry = calendar_entry_for_scope(scope)
     if not entry["can_write"]:
         raise HTTPException(
@@ -2059,9 +2075,13 @@ def create_synology_calendar_event(
         "inspectors": inspectors,
         "all_day": event.all_day,
         "calendar_scope": entry["scope"],
+        "calendarScope": entry["scope"],
         "calendar_name": entry["name"],
+        "calendarName": entry["name"],
         "calendar_url": entry["url"],
+        "calendarUrl": entry["url"],
         "can_edit": entry["can_write"],
+        "canEdit": entry["can_write"],
         "url": str(getattr(saved, "url", "")),
     }
 
@@ -2084,7 +2104,7 @@ def update_synology_calendar_event(uid: str, event: CalendarEventCreate) -> dict
     return create_synology_calendar_event(event, uid_override=uid, calendar_scope=event.calendar_scope)
 
 
-def delete_synology_calendar_event(uid: str, calendar_scope: str = "shared") -> dict:
+def delete_synology_calendar_event(uid: str, calendar_scope: str = "company_shared") -> dict:
     entry = calendar_entry_for_scope(calendar_scope)
     if not entry["can_write"]:
         raise HTTPException(
@@ -2102,19 +2122,19 @@ def delete_synology_calendar_event(uid: str, calendar_scope: str = "shared") -> 
     return {"deleted": True, "uid": uid}
 
 
-def list_synology_calendar_events(start: str, end: str, scopes: str = "personal,shared") -> list[dict]:
+def list_synology_calendar_events(start: str, end: str, scopes: str = "personal,company_shared") -> list[dict]:
     start_at = parse_event_datetime(start)
     end_at = parse_event_datetime(end)
     if end_at <= start_at:
         raise HTTPException(status_code=400, detail="end must be after start.")
 
     requested_scopes = {
-        item.strip().lower()
+        normalize_calendar_scope(item)
         for item in scopes.split(",")
-        if item.strip().lower() in {"personal", "shared"}
+        if normalize_calendar_scope(item) in {"personal", "company_shared", "other"}
     }
     if not requested_scopes:
-        requested_scopes = {"personal", "shared"}
+        requested_scopes = {"personal", "company_shared"}
 
     results: list[dict] = []
     for entry in synology_calendar_entries():
@@ -2407,27 +2427,17 @@ def get_calendar_list():
 
 @app.get("/calendar/events")
 @app.get("/api/calendar/events")
-def get_calendar_events(start: str, end: str, scopes: str = "personal,shared"):
+def get_calendar_events(start: str, end: str, scopes: str = "personal,company_shared"):
     return list_synology_calendar_events(start, end, scopes)
 
 
 @app.post("/calendar/events")
 @app.post("/api/calendar/events")
 def create_calendar_event(event: CalendarEventCreate):
-    scope = (event.calendar_scope or "shared").strip().lower()
-    if scope == "both":
-        created = []
-        for target_scope in ("personal", "shared"):
-            try:
-                created.append(create_synology_calendar_event(event, calendar_scope=target_scope))
-            except HTTPException as exc:
-                if target_scope == "shared" and exc.status_code == 403:
-                    continue
-                raise
-        if not created:
-            raise HTTPException(status_code=403, detail="No writable calendar was available.")
-        return {"created": True, "created_count": len(created), "events": created, **created[0]}
-    return create_synology_calendar_event(event)
+    scope = normalize_calendar_scope(event.calendar_scope or "company_shared")
+    if scope not in {"personal", "company_shared"}:
+        raise HTTPException(status_code=400, detail="calendar_scope must be personal or company_shared.")
+    return create_synology_calendar_event(event, calendar_scope=scope)
 
 
 @app.put("/calendar/events/{uid}")
@@ -2438,7 +2448,7 @@ def update_calendar_event(uid: str, event: CalendarEventCreate):
 
 @app.delete("/calendar/events/{uid}")
 @app.delete("/api/calendar/events/{uid}")
-def delete_calendar_event(uid: str, calendar_scope: str = "shared"):
+def delete_calendar_event(uid: str, calendar_scope: str = "company_shared"):
     return delete_synology_calendar_event(uid, calendar_scope)
 
 
