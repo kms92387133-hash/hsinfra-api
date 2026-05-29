@@ -89,6 +89,12 @@ class InspectionScheduleCreate(BaseModel):
     time: str = ""
 
 
+class CalendarInspector(BaseModel):
+    name: str = ""
+    email: str = ""
+    phone: str = ""
+
+
 class CalendarEventCreate(BaseModel):
     company_name: str
     title: str
@@ -97,6 +103,7 @@ class CalendarEventCreate(BaseModel):
     memo: str = ""
     location: str = ""
     inspector: str = ""
+    inspectors: List[CalendarInspector] = Field(default_factory=list)
     all_day: bool = False
 
 
@@ -1481,29 +1488,114 @@ def ics_fields(data: str, name: str) -> list[str]:
     ]
 
 
-def parse_attendee_names(data: str) -> str:
-    values = []
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+
+
+def inspector_display_name(inspector: dict | CalendarInspector) -> str:
+    if isinstance(inspector, CalendarInspector):
+        name = inspector.name.strip()
+        email = inspector.email.strip()
+        phone = inspector.phone.strip()
+    else:
+        name = str(inspector.get("name") or "").strip()
+        email = str(inspector.get("email") or "").strip()
+        phone = str(inspector.get("phone") or "").strip()
+    if name and email:
+        return f"{name} <{email}>"
+    if name and phone:
+        return f"{name} {phone}"
+    return name or email or phone
+
+
+def parse_inspector_text(value: str) -> dict:
+    raw = value.strip()
+    if not raw:
+        return {"name": "", "email": "", "phone": ""}
+    email_match = EMAIL_RE.search(raw)
+    email = email_match.group(0).strip() if email_match else ""
+    name = EMAIL_RE.sub("", raw).replace("<>", "").replace("<", "").replace(">", "").strip(" ,/")
+    if not name and email:
+        name = email
+    return {"name": name, "email": email, "phone": ""}
+
+
+def parse_description_inspectors(memo: str) -> list[dict]:
+    inspectors: list[dict] = []
+    for line in memo.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("점검자:"):
+            continue
+        parsed = parse_inspector_text(stripped.split(":", 1)[1])
+        if parsed["name"] or parsed["email"]:
+            inspectors.append(parsed)
+    return inspectors
+
+
+def parse_attendees(data: str) -> list[dict]:
+    inspectors: list[dict] = []
     for line in re.finditer(r"^ATTENDEE((?:;[^:]*)?):(.*)$", data, re.MULTILINE):
         params = line.group(1)
-        address = line.group(2).strip()
+        address = unescape_ics_text(line.group(2).strip()).replace("mailto:", "").strip()
         cn_match = re.search(r";CN=(?:\"([^\"]+)\"|([^;:]+))", params)
-        value = (
-            cn_match.group(1) or cn_match.group(2)
+        name = (
+            unescape_ics_text(cn_match.group(1) or cn_match.group(2)).strip()
             if cn_match
-            else address
+            else ""
         )
-        value = unescape_ics_text(value).replace("mailto:", "").strip()
-        if value and value not in values:
-            values.append(value)
-    return ", ".join(values)
+        email = address if EMAIL_RE.fullmatch(address) else ""
+        if not email:
+            continue
+        inspectors.append({"name": name or email, "email": email, "phone": ""})
+    return inspectors
 
-def attendee_ics_line(value: str) -> str:
-    inspector = value.strip()
-    if not inspector:
-        return ""
-    if "@" in inspector:
-        return f"ATTENDEE;CN={escape_ics_text(inspector)}:mailto:{escape_ics_text(inspector)}"
-    return f"ATTENDEE;CN={escape_ics_text(inspector)}:mailto:{quote(inspector, safe='')}@hsinfra.local"
+
+def unique_inspectors(inspectors: list[dict]) -> list[dict]:
+    seen: set[tuple[str, str]] = set()
+    result: list[dict] = []
+    for inspector in inspectors:
+        name = str(inspector.get("name") or "").strip()
+        email = str(inspector.get("email") or "").strip()
+        phone = str(inspector.get("phone") or "").strip()
+        key = (name.lower(), email.lower())
+        if not name and not email and not phone:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append({"name": name, "email": email, "phone": phone})
+    return result
+
+
+def calendar_event_inspectors(event: CalendarEventCreate) -> list[dict]:
+    inspectors = [
+        {
+            "name": inspector.name.strip(),
+            "email": inspector.email.strip(),
+            "phone": inspector.phone.strip(),
+        }
+        for inspector in event.inspectors
+    ]
+    # Backward compatibility only: a legacy inspector string can populate the
+    # app's internal inspector list, but plain names are never CalDAV guests.
+    if not inspectors and event.inspector.strip():
+        for part in re.split(r"[,\n]+", event.inspector):
+            parsed = parse_inspector_text(part)
+            if parsed["name"] or parsed["email"]:
+                inspectors.append(parsed)
+    return unique_inspectors(inspectors)
+
+
+def attendee_ics_lines(inspectors: list[dict]) -> list[str]:
+    lines: list[str] = []
+    for inspector in inspectors:
+        email = str(inspector.get("email") or "").strip()
+        if not EMAIL_RE.fullmatch(email):
+            continue
+        name = str(inspector.get("name") or "").strip() or email
+        lines.append(
+            f"ATTENDEE;CN={escape_ics_text(name)};ROLE=REQ-PARTICIPANT:mailto:{escape_ics_text(email)}"
+        )
+    return lines
 
 
 def calendar_event_object(uid: str):
@@ -1529,7 +1621,10 @@ def calendar_event_to_json(event) -> dict:
     if not company_name:
         company_name = company_name_if_exists(title)
 
-    inspector = parse_attendee_names(data)
+    inspectors = unique_inspectors(
+        parse_description_inspectors(memo) + parse_attendees(data)
+    )
+    inspector = ", ".join(inspector_display_name(item) for item in inspectors)
 
     return {
         "uid": ics_field(data, "UID"),
@@ -1538,6 +1633,7 @@ def calendar_event_to_json(event) -> dict:
         "memo": memo,
         "location": unescape_ics_text(ics_field(data, "LOCATION")),
         "inspector": inspector,
+        "inspectors": inspectors,
         "all_day": is_ics_all_day(data),
         "start_at": parse_ics_datetime(ics_field(data, "DTSTART")),
         "end_at": parse_ics_datetime(ics_field(data, "DTEND")),
@@ -1563,10 +1659,19 @@ def create_synology_calendar_event(
     title = event.title.strip() or event.company_name.strip() or "일정"
     description = event.memo.strip()
     company_name = event.company_name.strip()
+    inspectors = calendar_event_inspectors(event)
+    inspector_lines = [
+        f"점검자: {inspector_display_name(inspector)}"
+        for inspector in inspectors
+        if inspector_display_name(inspector)
+    ]
+    metadata_lines = []
     if company_name:
-        description = f"업체명: {company_name}\n{description}".strip()
+        metadata_lines.append(f"업체명: {company_name}")
+    metadata_lines.extend(inspector_lines)
+    description = "\n".join([*metadata_lines, description]).strip()
     location = event.location.strip() or company_address_for_calendar(company_name)
-    attendee_line = attendee_ics_line(event.inspector)
+    attendee_lines = attendee_ics_lines(inspectors)
 
     ics = "\r\n".join(
         [
@@ -1589,7 +1694,7 @@ def create_synology_calendar_event(
             f"SUMMARY:{escape_ics_text(title)}",
             f"DESCRIPTION:{escape_ics_text(description)}",
             *([f"LOCATION:{escape_ics_text(location)}"] if location else []),
-            *([attendee_line] if attendee_line else []),
+            *attendee_lines,
             "END:VEVENT",
             "END:VCALENDAR",
             "",
@@ -1611,7 +1716,8 @@ def create_synology_calendar_event(
         "start_at": start_at.isoformat(),
         "end_at": end_at.isoformat(),
         "location": location,
-        "inspector": event.inspector.strip(),
+        "inspector": ", ".join(inspector_display_name(item) for item in inspectors),
+        "inspectors": inspectors,
         "all_day": event.all_day,
         "url": str(getattr(saved, "url", "")),
     }
