@@ -1,6 +1,7 @@
 ﻿import base64
 import uuid
 import io
+import json
 import os
 import quopri
 import re
@@ -602,6 +603,138 @@ def inspection_calendar_columns_available() -> bool:
         "calendar_sync_error",
         "revision",
     }.issubset(columns)
+
+
+def calendar_event_column_names() -> set[str]:
+    try:
+        result = supabase.table("calendar_events").select("*").limit(1).execute()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "calendar_events table is missing or unavailable. "
+                "Run the calendar_events SQL in Supabase. "
+                f"Original error: {exc}"
+            ),
+        ) from exc
+    if not result.data:
+        return {
+            "uid",
+            "href",
+            "etag",
+            "calendar_scope",
+            "calendar_url",
+            "calendar_name",
+            "company_name",
+            "title",
+            "description",
+            "start_at",
+            "end_at",
+            "location",
+            "inspector",
+            "inspectors",
+            "attendees",
+            "inspection_id",
+            "can_edit",
+            "all_day",
+            "sync_status",
+            "last_synced_at",
+            "deleted",
+        }
+    return set(result.data[0].keys())
+
+
+def calendar_event_table_available() -> bool:
+    try:
+        calendar_event_column_names()
+        return True
+    except HTTPException:
+        return False
+
+
+def default_calendar_sync_start() -> str:
+    now = datetime.now(timezone.utc)
+    return (now - timedelta(days=90)).isoformat()
+
+
+def default_calendar_sync_end() -> str:
+    return (datetime.now(timezone.utc) + timedelta(days=180)).isoformat()
+
+
+def record_calendar_sync_run(
+    *,
+    status: str,
+    started_at: str,
+    finished_at: str,
+    scopes: str,
+    start_at: str,
+    end_at: str,
+    inserted: int = 0,
+    updated: int = 0,
+    deleted: int = 0,
+    error_message: str = "",
+) -> None:
+    try:
+        supabase.table("calendar_sync_runs").insert(
+            {
+                "status": status,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "scopes": scopes,
+                "start_at": start_at,
+                "end_at": end_at,
+                "inserted_count": inserted,
+                "updated_count": updated,
+                "deleted_count": deleted,
+                "error_message": error_message,
+            }
+        ).execute()
+    except Exception as exc:
+        print(f"calendar sync run log skipped: {exc}")
+
+
+def record_revision_conflict(
+    inspection_id: str,
+    attempted_revision: int,
+    current_revision: int,
+) -> None:
+    try:
+        supabase.table("inspection_revision_conflicts").insert(
+            {
+                "inspection_id": inspection_id,
+                "attempted_revision": attempted_revision,
+                "current_revision": current_revision,
+            }
+        ).execute()
+    except Exception as exc:
+        print(f"revision conflict log skipped: {exc}")
+
+
+def table_rows(table_name: str, columns: str = "*") -> list[dict]:
+    try:
+        return supabase.table(table_name).select(columns).execute().data or []
+    except Exception:
+        return []
+
+
+def latest_calendar_sync_summary() -> dict:
+    rows = (
+        supabase.table("calendar_sync_runs")
+        .select("*")
+        .order("started_at", desc=True)
+        .limit(50)
+        .execute()
+        .data
+        or []
+    )
+    last_success = next((row for row in rows if row.get("status") == "success"), None)
+    last_failed = next((row for row in rows if row.get("status") == "failed"), None)
+    return {
+        "last_success_at": (last_success or {}).get("finished_at"),
+        "last_error_message": (last_failed or {}).get("error_message", ""),
+        "sync_failure_count": sum(1 for row in rows if row.get("status") == "failed"),
+        "last_run": rows[0] if rows else None,
+    }
 
 
 def upsert_companies(companies: list[dict]) -> dict:
@@ -1340,17 +1473,17 @@ def sync_calendar_event_to_inspection(
             },
         )
 
-    return update_inspection_calendar_fields(
-        inspection_id,
-        {
-            "calendar_event_uid": event_result.get("uid", existing_uid),
-            "calendar_scope": event_result.get("calendar_scope", scope),
-            "calendar_url": event_result.get("calendar_url", ""),
-            "calendar_href": event_result.get("href", event_result.get("url", "")),
-            "calendar_sync_status": "synced",
-            "calendar_sync_error": "",
-        },
-    )
+    calendar_fields = {
+        "calendar_event_uid": event_result.get("uid", existing_uid),
+        "calendar_scope": event_result.get("calendar_scope", scope),
+        "calendar_url": event_result.get("calendar_url", ""),
+        "calendar_href": event_result.get("href", event_result.get("url", "")),
+        "calendar_sync_status": "synced",
+        "calendar_sync_error": "",
+    }
+    updated_fields = update_inspection_calendar_fields(inspection_id, calendar_fields)
+    upsert_calendar_event_for_inspection(inspection_id, event_result, event_payload)
+    return updated_fields
 
 
 
@@ -2345,6 +2478,373 @@ def enrich_calendar_events_with_inspections(events: list[dict]) -> list[dict]:
     return events
 
 
+def calendar_event_payload_from_json(event: dict, synced_at: str) -> dict:
+    inspectors = event.get("inspectors") or []
+    if not isinstance(inspectors, list):
+        inspectors = []
+    attendees = [item for item in inspectors if isinstance(item, dict) and str(item.get("email") or "").strip()]
+    payload = {
+        "uid": str(event.get("uid") or "").strip(),
+        "href": str(event.get("href") or "").strip(),
+        "etag": str(event.get("etag") or "").strip(),
+        "calendar_scope": normalize_calendar_scope(str(event.get("calendar_scope") or event.get("calendarScope") or "company_shared")),
+        "calendar_url": str(event.get("calendar_url") or event.get("calendarUrl") or "").strip(),
+        "calendar_name": str(event.get("calendar_name") or event.get("calendarName") or "").strip(),
+        "company_name": str(event.get("company_name") or event.get("companyName") or "").strip(),
+        "title": str(event.get("title") or "").strip(),
+        "description": str(event.get("memo") or event.get("description") or "").strip(),
+        "start_at": event.get("start_at") or event.get("startAt"),
+        "end_at": event.get("end_at") or event.get("endAt"),
+        "location": str(event.get("location") or "").strip(),
+        "inspector": str(event.get("inspector") or "").strip(),
+        "inspectors": inspectors,
+        "attendees": attendees,
+        "can_edit": bool(event.get("can_edit", event.get("canEdit", True))),
+        "all_day": bool(event.get("all_day", event.get("allDay", False))),
+        "sync_status": "synced",
+        "last_synced_at": synced_at,
+        "deleted": False,
+    }
+    linked = enrich_calendar_events_with_inspections([event])[0]
+    inspection_id = str(linked.get("inspection_id") or linked.get("inspectionId") or "").strip()
+    if inspection_id:
+        payload["inspection_id"] = inspection_id
+    allowed = calendar_event_column_names()
+    return {key: value for key, value in payload.items() if key in allowed}
+
+
+def find_calendar_event_row(calendar_url: str, uid: str, href: str) -> dict | None:
+    table = supabase.table("calendar_events")
+    if calendar_url and uid:
+        rows = table.select("*").eq("calendar_url", calendar_url).eq("uid", uid).limit(1).execute().data or []
+        if rows:
+            return rows[0]
+    if href:
+        rows = supabase.table("calendar_events").select("*").eq("href", href).limit(1).execute().data or []
+        if rows:
+            return rows[0]
+    return None
+
+
+def upsert_calendar_event_row(payload: dict) -> tuple[str, dict]:
+    existing = find_calendar_event_row(
+        str(payload.get("calendar_url") or ""),
+        str(payload.get("uid") or ""),
+        str(payload.get("href") or ""),
+    )
+    if existing:
+        result = (
+            supabase.table("calendar_events")
+            .update(payload)
+            .eq("id", existing["id"])
+            .execute()
+        )
+        return "updated", (result.data or [payload])[0]
+    result = supabase.table("calendar_events").insert(payload).execute()
+    return "inserted", (result.data or [payload])[0]
+
+
+def upsert_calendar_event_for_inspection(
+    inspection_id: str,
+    event_result: dict,
+    event_payload: CalendarEventCreate,
+) -> None:
+    try:
+        event = {
+            "uid": event_result.get("uid", ""),
+            "href": event_result.get("href", event_result.get("url", "")),
+            "etag": event_result.get("etag", ""),
+            "calendar_scope": event_result.get("calendar_scope", event_payload.calendar_scope),
+            "calendarScope": event_result.get("calendar_scope", event_payload.calendar_scope),
+            "calendar_name": event_result.get("calendar_name", event_result.get("calendarName", "")),
+            "calendarName": event_result.get("calendar_name", event_result.get("calendarName", "")),
+            "calendar_url": event_result.get("calendar_url", event_result.get("calendarUrl", "")),
+            "calendarUrl": event_result.get("calendar_url", event_result.get("calendarUrl", "")),
+            "company_name": event_payload.company_name,
+            "companyName": event_payload.company_name,
+            "title": event_payload.title,
+            "memo": event_payload.memo,
+            "description": event_payload.memo,
+            "start_at": event_result.get("start_at", event_payload.start_at),
+            "startAt": event_result.get("start_at", event_payload.start_at),
+            "end_at": event_result.get("end_at", event_payload.end_at),
+            "endAt": event_result.get("end_at", event_payload.end_at),
+            "location": event_result.get("location", event_payload.location),
+            "inspector": event_result.get("inspector", event_payload.inspector),
+            "inspectors": event_result.get("inspectors", event_payload.inspectors),
+            "all_day": event_result.get("all_day", event_payload.all_day),
+            "allDay": event_result.get("all_day", event_payload.all_day),
+            "can_edit": event_result.get("can_edit", event_result.get("canEdit", True)),
+        }
+        payload = calendar_event_payload_from_json(
+            event,
+            datetime.now(timezone.utc).isoformat(),
+        )
+        payload["inspection_id"] = inspection_id
+        payload["deleted"] = False
+        payload["sync_status"] = "synced"
+        upsert_calendar_event_row(payload)
+    except Exception as exc:
+        print(f"calendar_events inspection upsert skipped: {exc}")
+
+
+def mark_calendar_event_deleted_for_inspection(row: dict) -> None:
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        inspection_id = str(row.get("id") or "").strip()
+        uid = str(row.get("calendar_event_uid") or "").strip()
+        href = str(row.get("calendar_href") or "").strip()
+        update = {"deleted": True, "sync_status": "deleted", "last_synced_at": now}
+        if inspection_id:
+            supabase.table("calendar_events").update(update).eq("inspection_id", inspection_id).execute()
+        if uid:
+            supabase.table("calendar_events").update(update).eq("uid", uid).execute()
+        if href:
+            supabase.table("calendar_events").update(update).eq("href", href).execute()
+    except Exception as exc:
+        print(f"calendar_events inspection delete mark skipped: {exc}")
+
+
+def calendar_event_json_from_row(row: dict) -> dict:
+    inspectors = row.get("inspectors") or []
+    if isinstance(inspectors, str):
+        try:
+            inspectors = json.loads(inspectors)
+        except Exception:
+            inspectors = []
+    attendees = row.get("attendees") or []
+    if isinstance(attendees, str):
+        try:
+            attendees = json.loads(attendees)
+        except Exception:
+            attendees = []
+    return {
+        "uid": str(row.get("uid") or ""),
+        "company_name": str(row.get("company_name") or ""),
+        "companyName": str(row.get("company_name") or ""),
+        "title": str(row.get("title") or ""),
+        "memo": str(row.get("description") or ""),
+        "description": str(row.get("description") or ""),
+        "start_at": row.get("start_at"),
+        "startAt": row.get("start_at"),
+        "end_at": row.get("end_at"),
+        "endAt": row.get("end_at"),
+        "location": str(row.get("location") or ""),
+        "inspector": str(row.get("inspector") or ""),
+        "inspectors": inspectors if isinstance(inspectors, list) else [],
+        "attendees": attendees if isinstance(attendees, list) else [],
+        "all_day": bool(row.get("all_day")),
+        "allDay": bool(row.get("all_day")),
+        "calendar_scope": normalize_calendar_scope(str(row.get("calendar_scope") or "company_shared")),
+        "calendarScope": normalize_calendar_scope(str(row.get("calendar_scope") or "company_shared")),
+        "calendar_name": str(row.get("calendar_name") or ""),
+        "calendarName": str(row.get("calendar_name") or ""),
+        "calendar_url": str(row.get("calendar_url") or ""),
+        "calendarUrl": str(row.get("calendar_url") or ""),
+        "href": str(row.get("href") or ""),
+        "etag": str(row.get("etag") or ""),
+        "can_edit": bool(row.get("can_edit", True)),
+        "canEdit": bool(row.get("can_edit", True)),
+        "inspection_id": str(row.get("inspection_id") or ""),
+        "inspectionId": str(row.get("inspection_id") or ""),
+        "inspection_linked": bool(row.get("inspection_id")),
+        "inspectionLinked": bool(row.get("inspection_id")),
+        "sync_status": str(row.get("sync_status") or "synced"),
+        "syncStatus": str(row.get("sync_status") or "synced"),
+        "last_synced_at": row.get("last_synced_at"),
+        "lastSyncedAt": row.get("last_synced_at"),
+        "deleted": bool(row.get("deleted")),
+    }
+
+
+def parse_requested_calendar_scopes(scopes: str) -> set[str]:
+    requested = {
+        normalize_calendar_scope(item)
+        for item in scopes.split(",")
+        if normalize_calendar_scope(item) in {"personal", "company_shared", "other"}
+    }
+    return requested or {"personal", "company_shared"}
+
+
+def calendar_event_dedupe_keys(item: dict) -> list[str]:
+    keys = []
+    inspection_id = str(item.get("inspection_id") or item.get("inspectionId") or "").strip()
+    uid = str(item.get("uid") or "").strip()
+    href = str(item.get("href") or "").strip()
+    calendar_url = str(item.get("calendar_url") or item.get("calendarUrl") or "").strip()
+    if inspection_id:
+        keys.append(f"inspection:{inspection_id}")
+    if uid:
+        keys.append(f"uid:{uid}")
+    if href:
+        keys.append(f"href:{href}")
+    if calendar_url and uid:
+        keys.append(f"calendar_uid:{calendar_url}|{uid}")
+    if calendar_url and href:
+        keys.append(f"calendar_href:{calendar_url}|{href}")
+    return keys or [
+        "fallback:"
+        + "|".join(
+            [
+                str(item.get("title") or ""),
+                str(item.get("start_at") or item.get("startAt") or ""),
+                str(item.get("end_at") or item.get("endAt") or ""),
+            ]
+        )
+    ]
+
+
+def dedupe_calendar_event_items(items: list[dict]) -> list[dict]:
+    canonical: dict[str, dict] = {}
+    aliases: dict[str, str] = {}
+    for item in items:
+        keys = calendar_event_dedupe_keys(item)
+        existing_key = next((aliases[key] for key in keys if key in aliases), None)
+        if existing_key is None:
+            existing_key = keys[0]
+            canonical[existing_key] = item
+        else:
+            existing = canonical[existing_key]
+            if not existing.get("inspection_id") and item.get("inspection_id"):
+                canonical[existing_key] = item
+            elif existing.get("deleted") and not item.get("deleted"):
+                canonical[existing_key] = item
+        for key in keys:
+            aliases[key] = existing_key
+    return list(canonical.values())
+
+
+def list_calendar_events_from_db(start: str, end: str, scopes: str = "personal,company_shared") -> list[dict]:
+    start_at = parse_event_datetime(start)
+    end_at = parse_event_datetime(end)
+    if end_at <= start_at:
+        raise HTTPException(status_code=400, detail="end must be after start.")
+    rows = (
+        supabase.table("calendar_events")
+        .select("*")
+        .lt("start_at", end_at.isoformat())
+        .gt("end_at", start_at.isoformat())
+        .eq("deleted", False)
+        .execute()
+        .data
+        or []
+    )
+    requested = parse_requested_calendar_scopes(scopes)
+    result = [
+        calendar_event_json_from_row(row)
+        for row in rows
+        if normalize_calendar_scope(str(row.get("calendar_scope") or "")) in requested
+    ]
+    result = dedupe_calendar_event_items(result)
+    result.sort(key=lambda item: item.get("start_at") or "")
+    return result
+
+
+def sync_calendar_events_to_db(start: str, end: str, scopes: str = "personal,company_shared") -> dict:
+    run_started_at = datetime.now(timezone.utc).isoformat()
+    try:
+        start_at = parse_event_datetime(start)
+        end_at = parse_event_datetime(end)
+        if end_at <= start_at:
+            raise HTTPException(status_code=400, detail="end must be after start.")
+        requested = parse_requested_calendar_scopes(scopes)
+        synced_at = datetime.now(timezone.utc).isoformat()
+        inserted = 0
+        updated = 0
+        seen_keys: set[tuple[str, str, str]] = set()
+        synced_events: list[dict] = []
+
+        for entry in synology_calendar_entries():
+            if entry["scope"] not in requested:
+                continue
+            try:
+                events = entry["calendar"].date_search(start=start_at, end=end_at)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Synology CalDAV event query failed ({entry['name']}): {exc}",
+                ) from exc
+            for raw_event in events:
+                event = calendar_event_to_json(raw_event, entry)
+                payload = calendar_event_payload_from_json(event, synced_at)
+                action, row = upsert_calendar_event_row(payload)
+                if action == "inserted":
+                    inserted += 1
+                else:
+                    updated += 1
+                key = (
+                    str(payload.get("calendar_url") or ""),
+                    str(payload.get("uid") or ""),
+                    str(payload.get("href") or ""),
+                )
+                seen_keys.add(key)
+                synced_events.append(calendar_event_json_from_row(row))
+
+        existing_rows = (
+            supabase.table("calendar_events")
+            .select("id, uid, href, calendar_url, calendar_scope, start_at, end_at, deleted")
+            .lt("start_at", end_at.isoformat())
+            .gt("end_at", start_at.isoformat())
+            .eq("deleted", False)
+            .execute()
+            .data
+            or []
+        )
+        deleted = 0
+        for row in existing_rows:
+            scope = normalize_calendar_scope(str(row.get("calendar_scope") or ""))
+            if scope not in requested:
+                continue
+            key = (
+                str(row.get("calendar_url") or ""),
+                str(row.get("uid") or ""),
+                str(row.get("href") or ""),
+            )
+            if key in seen_keys:
+                continue
+            supabase.table("calendar_events").update(
+                {"deleted": True, "sync_status": "deleted", "last_synced_at": synced_at}
+            ).eq("id", row["id"]).execute()
+            deleted += 1
+
+        result = {
+            "success": True,
+            "inserted": inserted,
+            "updated": updated,
+            "deleted": deleted,
+            "synced": inserted + updated,
+            "last_synced_at": synced_at,
+            "lastSyncedAt": synced_at,
+            "scopes": sorted(requested),
+            "events": sorted(synced_events, key=lambda item: item.get("start_at") or ""),
+        }
+        record_calendar_sync_run(
+            status="success",
+            started_at=run_started_at,
+            finished_at=synced_at,
+            scopes=",".join(sorted(requested)),
+            start_at=start_at.isoformat(),
+            end_at=end_at.isoformat(),
+            inserted=inserted,
+            updated=updated,
+            deleted=deleted,
+        )
+        return result
+    except Exception as exc:
+        finished_at = datetime.now(timezone.utc).isoformat()
+        detail = getattr(exc, "detail", str(exc))
+        record_calendar_sync_run(
+            status="failed",
+            started_at=run_started_at,
+            finished_at=finished_at,
+            scopes=scopes,
+            start_at=start,
+            end_at=end,
+            error_message=str(detail),
+        )
+        raise
+
+
 def list_synology_calendar_events(start: str, end: str, scopes: str = "personal,company_shared") -> list[dict]:
     start_at = parse_event_datetime(start)
     end_at = parse_event_datetime(end)
@@ -2600,6 +3100,7 @@ def update_inspection_record(inspection_id: str, inspection: InspectionCreate):
     current_revision = int(existing_row.get("revision") or 0)
     if "revision" in allowed_columns and inspection.revision > 0:
         if inspection.revision != current_revision:
+            record_revision_conflict(inspection_id, inspection.revision, current_revision)
             raise HTTPException(status_code=409, detail="다른 사용자가 수정했습니다.")
 
     payload = inspection_payload_from_create(inspection)
@@ -2665,6 +3166,9 @@ def delete_inspection_record(inspection_id: str):
             except Exception as exc:
                 calendar_delete_error = str(exc)
 
+    if existing.data:
+        mark_calendar_event_deleted_for_inspection(existing.data[0])
+
     supabase.table("inspection_photos").delete().eq(
         "inspection_id", inspection_id
     ).execute()
@@ -2704,7 +3208,108 @@ def get_calendar_list():
 @app.get("/calendar/events")
 @app.get("/api/calendar/events")
 def get_calendar_events(start: str, end: str, scopes: str = "personal,company_shared"):
-    return list_synology_calendar_events(start, end, scopes)
+    return list_calendar_events_from_db(start, end, scopes)
+
+
+@app.post("/calendar/sync")
+@app.post("/api/calendar/sync")
+def sync_calendar_events(start: str, end: str, scopes: str = "personal,company_shared"):
+    return sync_calendar_events_to_db(start, end, scopes)
+
+
+@app.get("/calendar/status")
+@app.get("/api/calendar/status")
+def get_calendar_status():
+    events = table_rows(
+        "calendar_events",
+        "id, sync_status, deleted, inspection_id, last_synced_at",
+    )
+    total = len(events)
+    pending = sum(1 for row in events if row.get("sync_status") == "pending")
+    failed = sum(1 for row in events if row.get("sync_status") == "failed")
+    deleted = sum(1 for row in events if row.get("deleted") is True or row.get("sync_status") == "deleted")
+    unlinked = sum(1 for row in events if not row.get("deleted") and not row.get("inspection_id"))
+    latest_event_sync = max(
+        [str(row.get("last_synced_at") or "") for row in events if row.get("last_synced_at")],
+        default="",
+    )
+    sync_summary = latest_calendar_sync_summary()
+    return {
+        "status": "error" if sync_summary.get("last_error_message") else "ok",
+        "last_synced_at": latest_event_sync or sync_summary.get("last_success_at"),
+        "calendar_events_count": total,
+        "pending_count": pending,
+        "failed_count": failed,
+        "deleted_count": deleted,
+        "unlinked_calendar_event_count": unlinked,
+        **sync_summary,
+    }
+
+
+@app.post("/calendar/retry")
+@app.post("/api/calendar/retry")
+def retry_calendar_sync(start: str | None = None, end: str | None = None, scopes: str = "personal,company_shared"):
+    try:
+        supabase.table("calendar_events").update({"sync_status": "pending"}).in_(
+            "sync_status", ["failed", "pending"]
+        ).execute()
+    except Exception:
+        pass
+    return sync_calendar_events_to_db(
+        start or default_calendar_sync_start(),
+        end or default_calendar_sync_end(),
+        scopes,
+    )
+
+
+@app.get("/admin/calendar-diagnostics")
+@app.get("/api/admin/calendar-diagnostics")
+def get_calendar_diagnostics():
+    events = table_rows(
+        "calendar_events",
+        "id, uid, href, calendar_scope, calendar_url, title, start_at, inspection_id, sync_status, deleted",
+    )
+    inspections = table_rows(
+        "inspections",
+        "id, date, category, calendar_event_uid, calendar_href, calendar_scope, calendar_sync_status, revision",
+    )
+    event_uids = {str(row.get("uid") or "") for row in events if row.get("uid")}
+    event_hrefs = {str(row.get("href") or "") for row in events if row.get("href")}
+    orphan_calendar_events = [
+        row
+        for row in events
+        if not row.get("deleted") and not row.get("inspection_id")
+    ][:100]
+    orphan_inspections = [
+        row
+        for row in inspections
+        if (row.get("calendar_event_uid") or row.get("calendar_href"))
+        and str(row.get("calendar_event_uid") or "") not in event_uids
+        and str(row.get("calendar_href") or "") not in event_hrefs
+    ][:100]
+    conflicts = []
+    try:
+        conflicts = (
+            supabase.table("inspection_revision_conflicts")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(100)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        conflicts = []
+    return {
+        "orphan_calendar_events": orphan_calendar_events,
+        "orphan_inspections": orphan_inspections,
+        "revision_conflicts": conflicts,
+        "counts": {
+            "orphan_calendar_events": len(orphan_calendar_events),
+            "orphan_inspections": len(orphan_inspections),
+            "revision_conflicts": len(conflicts),
+        },
+    }
 
 
 @app.post("/calendar/events")
