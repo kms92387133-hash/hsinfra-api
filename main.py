@@ -6,6 +6,7 @@ import os
 import quopri
 import re
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import List
 from urllib.error import HTTPError
 from urllib.parse import quote, unquote, urljoin
@@ -38,6 +39,8 @@ supabase = create_client(
     os.getenv("SUPABASE_URL"),
     os.getenv("SUPABASE_SERVICE_KEY"),
 )
+
+calendar_sync_lock = Lock()
 
 
 class CompanyCreate(BaseModel):
@@ -741,9 +744,15 @@ def latest_calendar_sync_summary() -> dict:
         }
     last_success = next((row for row in rows if row.get("status") == "success"), None)
     last_failed = next((row for row in rows if row.get("status") == "failed"), None)
+    last_success_at = (last_success or {}).get("finished_at")
+    last_failed_at = (last_failed or {}).get("finished_at")
+    latest_error_message = ""
+    if last_failed:
+        if not last_success_at or str(last_failed_at or "") > str(last_success_at):
+            latest_error_message = (last_failed or {}).get("error_message", "")
     return {
-        "last_success_at": (last_success or {}).get("finished_at"),
-        "last_error_message": (last_failed or {}).get("error_message", ""),
+        "last_success_at": last_success_at,
+        "last_error_message": latest_error_message,
         "sync_failure_count": sum(1 for row in rows if row.get("status") == "failed"),
         "last_run": rows[0] if rows else None,
     }
@@ -2857,6 +2866,21 @@ def sync_calendar_events_to_db(start: str, end: str, scopes: str = "personal,com
         raise
 
 
+def run_calendar_sync_with_lock(start: str, end: str, scopes: str = "personal,company_shared") -> dict:
+    if not calendar_sync_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "status": "already_running",
+                "message": "Calendar sync is already running.",
+            },
+        )
+    try:
+        return sync_calendar_events_to_db(start, end, scopes)
+    finally:
+        calendar_sync_lock.release()
+
+
 def list_synology_calendar_events(start: str, end: str, scopes: str = "personal,company_shared") -> list[dict]:
     start_at = parse_event_datetime(start)
     end_at = parse_event_datetime(end)
@@ -3226,7 +3250,7 @@ def get_calendar_events(start: str, end: str, scopes: str = "personal,company_sh
 @app.post("/calendar/sync")
 @app.post("/api/calendar/sync")
 def sync_calendar_events(start: str, end: str, scopes: str = "personal,company_shared"):
-    return sync_calendar_events_to_db(start, end, scopes)
+    return run_calendar_sync_with_lock(start, end, scopes)
 
 
 @app.get("/calendar/status")
@@ -3246,8 +3270,16 @@ def get_calendar_status():
         default="",
     )
     sync_summary = latest_calendar_sync_summary()
+    last_run = sync_summary.get("last_run") or {}
+    status = (
+        "ok"
+        if last_run.get("status") == "success"
+        else "error"
+        if sync_summary.get("last_error_message")
+        else "ok"
+    )
     return {
-        "status": "error" if sync_summary.get("last_error_message") else "ok",
+        "status": status,
         "last_synced_at": latest_event_sync or sync_summary.get("last_success_at"),
         "calendar_events_count": total,
         "pending_count": pending,
@@ -3267,7 +3299,7 @@ def retry_calendar_sync(start: str | None = None, end: str | None = None, scopes
         ).execute()
     except Exception:
         pass
-    return sync_calendar_events_to_db(
+    return run_calendar_sync_with_lock(
         start or default_calendar_sync_start(),
         end or default_calendar_sync_end(),
         scopes,
