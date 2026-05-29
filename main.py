@@ -1,7 +1,8 @@
-import base64
+﻿import base64
 import uuid
 import io
 import os
+import quopri
 import re
 from datetime import datetime, timedelta, timezone
 from typing import List
@@ -90,6 +91,12 @@ class InspectionScheduleCreate(BaseModel):
 
 
 class CalendarInspector(BaseModel):
+    name: str = ""
+    email: str = ""
+    phone: str = ""
+
+
+class ContactInfo(BaseModel):
     name: str = ""
     email: str = ""
     phone: str = ""
@@ -1183,6 +1190,139 @@ def caldav_config() -> tuple[str, str, str]:
     return url, username, password
 
 
+def carddav_config() -> tuple[str, str, str]:
+    url = (
+        os.getenv("SYNOLOGY_CARDDAV_URL", "")
+        or os.getenv("CONTACTS_CARDDAV_URL", "")
+        or "https://contacts.hsinfra.kr/carddav/tech11/c3694919-9c09-41e9-81c8-1716f077af11"
+    ).strip()
+    username = (
+        os.getenv("SYNOLOGY_CARDDAV_USERNAME", "")
+        or os.getenv("CONTACTS_CARDDAV_USERNAME", "")
+        or os.getenv("SYNOLOGY_CALDAV_USERNAME", "")
+    ).strip()
+    password = (
+        os.getenv("SYNOLOGY_CARDDAV_PASSWORD", "")
+        or os.getenv("CONTACTS_CARDDAV_PASSWORD", "")
+        or os.getenv("SYNOLOGY_CALDAV_PASSWORD", "")
+    ).strip()
+    if not url or not username or not password:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Synology CardDAV config is missing. Set SYNOLOGY_CARDDAV_URL, "
+                "SYNOLOGY_CARDDAV_USERNAME, and SYNOLOGY_CARDDAV_PASSWORD. "
+                "CALDAV credentials are used as a fallback."
+            ),
+        )
+    return url.rstrip("/") + "/", username, password
+
+
+def unfold_vcard(value: str) -> str:
+    return re.sub(r"\r?\n[ \t]", "", value.replace("\r\n", "\n"))
+
+
+def decode_vcard_value(value: str, params: str) -> str:
+    raw = value.strip()
+    if "QUOTED-PRINTABLE" in params.upper():
+        try:
+            raw = quopri.decodestring(raw).decode("utf-8")
+        except Exception:
+            try:
+                raw = quopri.decodestring(raw).decode("cp949")
+            except Exception:
+                pass
+    return (
+        raw.replace("\\n", "\n")
+        .replace("\\,", ",")
+        .replace("\\;", ";")
+        .strip()
+    )
+
+
+def parse_vcard(vcard: str) -> ContactInfo | None:
+    data = unfold_vcard(vcard)
+    name = ""
+    email = ""
+    phone = ""
+
+    for line in data.splitlines():
+        if ":" not in line:
+            continue
+        left, value = line.split(":", 1)
+        field = left.split(";", 1)[0].upper()
+        params = left.upper()
+        decoded = decode_vcard_value(value, params)
+        if field == "FN" and not name:
+            name = decoded
+        elif field == "N" and not name:
+            parts = [part for part in decoded.split(";") if part.strip()]
+            name = " ".join(reversed(parts[:2])).strip() if len(parts) >= 2 else decoded
+        elif field == "EMAIL" and not email:
+            email = decoded
+        elif field == "TEL" and not phone:
+            phone = decoded
+
+    if not name and email:
+        name = email
+    if not name and not email and not phone:
+        return None
+    return ContactInfo(name=name, email=email, phone=phone)
+
+
+def carddav_contact_cards() -> list[str]:
+    url, username, password = carddav_config()
+    body = '''<?xml version="1.0" encoding="utf-8" ?>
+<card:addressbook-query xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">
+  <d:prop>
+    <card:address-data />
+  </d:prop>
+</card:addressbook-query>'''
+
+    response = requests.request(
+        "REPORT",
+        url,
+        auth=(username, password),
+        headers={"Depth": "1", "Content-Type": "application/xml; charset=utf-8"},
+        data=body.encode("utf-8"),
+        timeout=25,
+    )
+    if response.status_code not in (207, 200):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Synology CardDAV search failed: HTTP {response.status_code} {response.text[:300]}",
+        )
+
+    root = ET.fromstring(response.content)
+    ns = {"card": "urn:ietf:params:xml:ns:carddav"}
+    return [
+        (node.text or "").strip()
+        for node in root.findall(".//card:address-data", ns)
+        if (node.text or "").strip()
+    ]
+
+
+def search_carddav_contacts(q: str = "", limit: int = 30) -> list[dict]:
+    keyword = q.strip().lower()
+    contacts: list[ContactInfo] = []
+    seen: set[tuple[str, str, str]] = set()
+    for card in carddav_contact_cards():
+        contact = parse_vcard(card)
+        if contact is None:
+            continue
+        haystack = " ".join([contact.name, contact.email, contact.phone]).lower()
+        if keyword and keyword not in haystack:
+            continue
+        key = (contact.name.lower(), contact.email.lower(), contact.phone.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        contacts.append(contact)
+        if len(contacts) >= limit:
+            break
+    return [contact.dict() for contact in contacts]
+
+
 
 def synology_calendar_by_display_name(
     base_url: str,
@@ -2009,6 +2149,12 @@ def delete_inspection_record(inspection_id: str):
     ).execute()
     supabase.table("inspections").delete().eq("id", inspection_id).execute()
     return {"deleted": True, "id": inspection_id}
+
+
+@app.get("/contacts/search")
+@app.get("/api/contacts/search")
+def search_contacts(q: str = "", limit: int = 30):
+    return search_carddav_contacts(q, max(1, min(limit, 100)))
 
 
 @app.get("/calendar/check")
