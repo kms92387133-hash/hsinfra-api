@@ -931,7 +931,31 @@ def upload_photo_to_filestation(
 
 
 def inspection_folder_name(*, company_name: str, date: str, category: str) -> str:
-    return clean_path_segment(f"{compact_date(date)} ({category}) {company_name}")
+    return (
+        f"{inspection_company_folder_name(company_name)}/"
+        f"{inspection_subfolder_name(date=date, category=category)}"
+    )
+
+
+def inspection_company_folder_name(company_name: str) -> str:
+    return clean_path_segment(company_name.strip() or "업체명 없음")
+
+
+def inspection_subfolder_name(*, date: str, category: str) -> str:
+    clean_date = normalize_inspection_date(date)
+    clean_category = normalize_inspection_category(category)
+    return clean_path_segment(f"{clean_category}_{clean_date}")
+
+
+def normalize_inspection_date(value: str) -> str:
+    text = (value or "").strip()
+    match = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", text)
+    if match:
+        return text
+    compact = re.sub(r"[^0-9]", "", text)
+    if len(compact) >= 8:
+        return f"{compact[:4]}-{compact[4:6]}-{compact[6:8]}"
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def inspection_folder_path(*, company_name: str, date: str, category: str) -> str:
@@ -1088,6 +1112,18 @@ def parse_inspection_folder_name(name: str) -> dict | None:
     }
 
 
+def parse_inspection_subfolder_name(company_name: str, name: str) -> dict | None:
+    match = re.match(r"^(.+?)_(\d{4}-\d{2}-\d{2})$", name.strip())
+    if not match:
+        return None
+    category, date = match.groups()
+    return {
+        "date": normalize_inspection_date(date),
+        "category": normalize_inspection_category(category),
+        "company_name": resolve_company_name_from_nas(company_name.strip()),
+    }
+
+
 def parse_nas_photo_file_name(file_name: str, fallback_order: int) -> dict | None:
     if not re.search(r"\.(jpg|jpeg|png)$", file_name, re.IGNORECASE):
         return None
@@ -1153,16 +1189,41 @@ def sync_nas_photo_metadata(
     for folder in folders:
         folder_name = (folder.get("name") or "").strip()
         folder_info = parse_inspection_folder_name(folder_name)
-        if folder_info is None:
+        if folder_info is not None:
+            folder_key = (
+                folder_info["date"],
+                normalize_inspection_category(folder_info["category"]),
+                normalize_company_key(folder_info["company_name"]),
+            )
+            if target_keys and folder_key not in target_keys:
+                continue
+            parsed_folders.append((folder, folder_info, folder_name))
             continue
-        folder_key = (
-            folder_info["date"],
-            normalize_inspection_category(folder_info["category"]),
-            normalize_company_key(folder_info["company_name"]),
-        )
-        if target_keys and folder_key not in target_keys:
+
+        company_folder_name = folder_name
+        company_folder_path = folder.get("path") or f"{root_path}/{company_folder_name}"
+        try:
+            subfolders = [
+                item for item in filestation_list(company_folder_path) if item.get("isdir")
+            ]
+        except Exception:
             continue
-        parsed_folders.append((folder, folder_info, folder_name))
+        for subfolder in subfolders:
+            subfolder_name = (subfolder.get("name") or "").strip()
+            folder_info = parse_inspection_subfolder_name(
+                company_folder_name,
+                subfolder_name,
+            )
+            if folder_info is None:
+                continue
+            folder_key = (
+                folder_info["date"],
+                normalize_inspection_category(folder_info["category"]),
+                normalize_company_key(folder_info["company_name"]),
+            )
+            if target_keys and folder_key not in target_keys:
+                continue
+            parsed_folders.append((subfolder, folder_info, f"{company_folder_name}/{subfolder_name}"))
 
     if not target_keys:
         parsed_folders = parsed_folders[-30:]
@@ -1194,6 +1255,11 @@ def sync_nas_photo_metadata(
             fallback_order_by_facility[facility_name] = parsed["sort_order"] + 1
 
             storage_path = file.get("path") or f"{folder_path}/{file_name}"
+            nas_folder = inspection_company_folder_name(folder_info["company_name"])
+            nas_subfolder = inspection_subfolder_name(
+                date=folder_info["date"],
+                category=folder_info["category"],
+            )
             supabase.table("inspection_photos").upsert(
                 {
                     "inspection_id": inspection_id,
@@ -1203,6 +1269,12 @@ def sync_nas_photo_metadata(
                     "storage_path": storage_path,
                     "sort_order": parsed["sort_order"],
                     "uploaded_to_nas": True,
+                    "nas_folder": nas_folder,
+                    "nas_subfolder": nas_subfolder,
+                    "nas_filename": file_name,
+                    "upload_status": "uploaded",
+                    "upload_error": "",
+                    "uploaded_at": datetime.now(timezone.utc).isoformat(),
                 },
                 on_conflict="inspection_id,facility_name,sort_order",
             ).execute()
@@ -1297,6 +1369,51 @@ def upload_photo_to_nas(
             status_code=502,
             detail=f"NAS File Station upload failed: {exc}",
         ) from exc
+
+
+def upsert_inspection_photo_metadata(photo_payload: dict) -> tuple[dict, bool, str]:
+    try:
+        inserted_photo = (
+            supabase.table("inspection_photos")
+            .upsert(
+                photo_payload,
+                on_conflict="inspection_id,facility_name,sort_order",
+            )
+            .execute()
+        )
+        return inserted_photo.data[0] if inserted_photo.data else {}, True, ""
+    except Exception as exc:
+        metadata_error = str(exc)
+        try:
+            existing_photo = (
+                supabase.table("inspection_photos")
+                .select("id")
+                .eq("inspection_id", photo_payload["inspection_id"])
+                .eq("facility_name", photo_payload["facility_name"])
+                .eq("sort_order", photo_payload["sort_order"])
+                .limit(1)
+                .execute()
+            )
+            if existing_photo.data:
+                photo_id = existing_photo.data[0]["id"]
+                updated_photo = (
+                    supabase.table("inspection_photos")
+                    .update(photo_payload)
+                    .eq("id", photo_id)
+                    .execute()
+                )
+                return (
+                    updated_photo.data[0] if updated_photo.data else {"id": photo_id},
+                    True,
+                    "",
+                )
+
+            inserted_photo = (
+                supabase.table("inspection_photos").insert(photo_payload).execute()
+            )
+            return inserted_photo.data[0] if inserted_photo.data else {}, True, ""
+        except Exception as fallback_exc:
+            return {}, False, f"{metadata_error}; fallback failed: {fallback_exc}"
 
 
 def ensure_company(company_name: str) -> str:
@@ -3066,7 +3183,7 @@ def get_inspections():
         photos = (
             supabase.table("inspection_photos")
             .select(
-                "id, inspection_id, facility_name, photo_title, file_name, storage_path, sort_order, uploaded_to_nas"
+                "id, inspection_id, facility_name, photo_title, file_name, storage_path, sort_order, uploaded_to_nas, local_path, local_filename, nas_folder, nas_subfolder, nas_filename, upload_status, upload_error, uploaded_at"
             )
             .in_("inspection_id", inspection_ids)
             .execute()
@@ -3530,32 +3647,42 @@ def upload_inspection(inspection: InspectionUpload):
             file_name=photo.file_name,
             content=content,
         )
-
-        inserted_photo = (
-            supabase.table("inspection_photos")
-            .upsert(
-                {
-                    "inspection_id": inspection_id,
-                    "facility_name": photo.facility_name,
-                    "photo_title": photo.photo_title,
-                    "file_name": photo.file_name,
-                    "storage_path": nas_path,
-                    "sort_order": photo.sort_order,
-                    "uploaded_to_nas": True,
-                },
-                on_conflict="inspection_id,facility_name,sort_order",
-            )
-            .execute()
+        nas_folder = inspection_company_folder_name(company_name)
+        nas_subfolder = inspection_subfolder_name(
+            date=inspection.date,
+            category=inspection.category,
         )
-        photo_row = inserted_photo.data[0] if inserted_photo.data else {}
+        nas_filename = clean_path_segment(photo.file_name)
+
+        photo_row, _, _ = upsert_inspection_photo_metadata(
+            {
+                "inspection_id": inspection_id,
+                "facility_name": photo.facility_name,
+                "photo_title": photo.photo_title,
+                "file_name": nas_filename,
+                "storage_path": nas_path,
+                "sort_order": photo.sort_order,
+                "uploaded_to_nas": True,
+                "nas_folder": nas_folder,
+                "nas_subfolder": nas_subfolder,
+                "nas_filename": nas_filename,
+                "upload_status": "uploaded",
+                "upload_error": "",
+                "uploaded_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
         uploaded_photos.append(
             {
                 "id": str(photo_row.get("id", "")),
                 "facility_name": photo.facility_name,
                 "photo_title": photo.photo_title,
-                "file_name": photo.file_name,
+                "file_name": nas_filename,
                 "storage_path": nas_path,
                 "sort_order": photo.sort_order,
+                "nas_folder": nas_folder,
+                "nas_subfolder": nas_subfolder,
+                "nas_filename": nas_filename,
+                "upload_status": "uploaded",
             }
         )
 
@@ -3580,6 +3707,8 @@ async def upload_inspection_photo(
     photo_title: str = Form(...),
     file_name: str = Form(...),
     sort_order: int = Form(0),
+    local_path: str = Form(""),
+    local_filename: str = Form(""),
     file: UploadFile = File(...),
 ):
     company_name = company_name.strip()
@@ -3597,71 +3726,65 @@ async def upload_inspection_photo(
     )
     saved_inspection_id = create_inspection(company_id, upload)
     content = await file.read()
-
-    nas_path = upload_photo_to_nas(
-        company_name=company_name,
-        date=date,
-        category=category,
-        file_name=file_name,
-        content=content,
-    )
-
-    photo_payload = {
+    nas_folder = inspection_company_folder_name(company_name)
+    nas_subfolder = inspection_subfolder_name(date=date, category=category)
+    nas_filename = clean_path_segment(file_name)
+    base_photo_payload = {
         "inspection_id": saved_inspection_id,
         "facility_name": facility_name,
         "photo_title": photo_title,
-        "file_name": file_name,
-        "storage_path": nas_path,
+        "file_name": nas_filename,
         "sort_order": sort_order,
-        "uploaded_to_nas": True,
+        "local_path": local_path.strip(),
+        "local_filename": local_filename.strip(),
+        "nas_folder": nas_folder,
+        "nas_subfolder": nas_subfolder,
+        "nas_filename": nas_filename,
     }
-    photo_row = {}
-    metadata_saved = False
-    metadata_error = ""
 
     try:
-        inserted_photo = (
-            supabase.table("inspection_photos")
-            .upsert(
-                photo_payload,
-                on_conflict="inspection_id,facility_name,sort_order",
-            )
-            .execute()
+        nas_path = upload_photo_to_nas(
+            company_name=company_name,
+            date=date,
+            category=category,
+            file_name=nas_filename,
+            content=content,
         )
-        photo_row = inserted_photo.data[0] if inserted_photo.data else {}
-        metadata_saved = True
+    except HTTPException as exc:
+        failed_payload = {
+            **base_photo_payload,
+            "storage_path": "",
+            "uploaded_to_nas": False,
+            "upload_status": "failed",
+            "upload_error": str(exc.detail),
+        }
+        upsert_inspection_photo_metadata(failed_payload)
+        raise
     except Exception as exc:
-        metadata_error = str(exc)
-        try:
-            existing_photo = (
-                supabase.table("inspection_photos")
-                .select("id")
-                .eq("inspection_id", saved_inspection_id)
-                .eq("facility_name", facility_name)
-                .eq("sort_order", sort_order)
-                .limit(1)
-                .execute()
-            )
-            if existing_photo.data:
-                photo_id = existing_photo.data[0]["id"]
-                updated_photo = (
-                    supabase.table("inspection_photos")
-                    .update(photo_payload)
-                    .eq("id", photo_id)
-                    .execute()
-                )
-                photo_row = updated_photo.data[0] if updated_photo.data else {"id": photo_id}
-            else:
-                inserted_photo = (
-                    supabase.table("inspection_photos")
-                    .insert(photo_payload)
-                    .execute()
-                )
-                photo_row = inserted_photo.data[0] if inserted_photo.data else {}
-            metadata_saved = True
-            metadata_error = ""
-        except Exception as fallback_exc:
-            metadata_error = f"{metadata_error}; fallback failed: {fallback_exc}"
+        failed_payload = {
+            **base_photo_payload,
+            "storage_path": "",
+            "uploaded_to_nas": False,
+            "upload_status": "failed",
+            "upload_error": str(exc),
+        }
+        upsert_inspection_photo_metadata(failed_payload)
+        raise HTTPException(
+            status_code=502,
+            detail=f"NAS File Station upload failed: {exc}",
+        ) from exc
+
+    photo_payload = {
+        **base_photo_payload,
+        "storage_path": nas_path,
+        "uploaded_to_nas": True,
+        "upload_status": "uploaded",
+        "upload_error": "",
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    photo_row, metadata_saved, metadata_error = upsert_inspection_photo_metadata(
+        photo_payload
+    )
 
     return {
         "company_id": company_id,
@@ -3674,9 +3797,16 @@ async def upload_inspection_photo(
                 "id": str(photo_row.get("id", "")),
                 "facility_name": facility_name,
                 "photo_title": photo_title,
-                "file_name": file_name,
+                "file_name": nas_filename,
                 "storage_path": nas_path,
                 "sort_order": sort_order,
+                "local_path": local_path.strip(),
+                "local_filename": local_filename.strip(),
+                "nas_folder": nas_folder,
+                "nas_subfolder": nas_subfolder,
+                "nas_filename": nas_filename,
+                "upload_status": "uploaded",
+                "upload_error": "",
             }
         ],
     }

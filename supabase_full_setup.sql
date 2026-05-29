@@ -86,6 +86,14 @@ create table if not exists public.inspection_photos (
   storage_path text not null default '',
   sort_order integer not null default 0,
   uploaded_to_nas boolean not null default false,
+  local_path text not null default '',
+  local_filename text not null default '',
+  nas_folder text not null default '',
+  nas_subfolder text not null default '',
+  nas_filename text not null default '',
+  upload_status text not null default 'not_uploaded',
+  upload_error text not null default '',
+  uploaded_at timestamptz,
   created_at timestamptz not null default now()
 );
 
@@ -97,6 +105,14 @@ alter table public.inspection_photos
   add column if not exists storage_path text not null default '',
   add column if not exists sort_order integer not null default 0,
   add column if not exists uploaded_to_nas boolean not null default false,
+  add column if not exists local_path text not null default '',
+  add column if not exists local_filename text not null default '',
+  add column if not exists nas_folder text not null default '',
+  add column if not exists nas_subfolder text not null default '',
+  add column if not exists nas_filename text not null default '',
+  add column if not exists upload_status text not null default 'not_uploaded',
+  add column if not exists upload_error text not null default '',
+  add column if not exists uploaded_at timestamptz,
   add column if not exists created_at timestamptz not null default now();
 
 create index if not exists inspection_photos_inspection_id_idx
@@ -107,6 +123,12 @@ create index if not exists inspection_photos_storage_path_idx
 
 create unique index if not exists inspection_photos_unique_slot_idx
   on public.inspection_photos(inspection_id, facility_name, sort_order);
+
+create index if not exists inspection_photos_upload_status_idx
+  on public.inspection_photos(upload_status);
+
+create index if not exists inspection_photos_nas_lookup_idx
+  on public.inspection_photos(nas_folder, nas_subfolder, nas_filename);
 
 create table if not exists public.inspection_schedules (
   id uuid primary key default gen_random_uuid(),
