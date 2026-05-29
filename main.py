@@ -1457,6 +1457,18 @@ def create_inspection(company_id: str, inspection: InspectionUpload) -> str:
         ).eq("id", inspection.inspection_id.strip()).execute()
         return inspection.inspection_id.strip()
 
+    existing = (
+        supabase.table("inspections")
+        .select("id")
+        .eq("company_id", company_id)
+        .eq("date", inspection.date)
+        .eq("category", inspection.category)
+        .limit(1)
+        .execute()
+    )
+    if existing.data:
+        return str(existing.data[0]["id"])
+
     inserted = (
         supabase.table("inspections")
         .insert(
