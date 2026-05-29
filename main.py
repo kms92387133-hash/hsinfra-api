@@ -718,15 +718,27 @@ def table_rows(table_name: str, columns: str = "*") -> list[dict]:
 
 
 def latest_calendar_sync_summary() -> dict:
-    rows = (
-        supabase.table("calendar_sync_runs")
-        .select("*")
-        .order("started_at", desc=True)
-        .limit(50)
-        .execute()
-        .data
-        or []
-    )
+    try:
+        rows = (
+            supabase.table("calendar_sync_runs")
+            .select("*")
+            .order("started_at", desc=True)
+            .limit(50)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as exc:
+        return {
+            "last_success_at": None,
+            "last_error_message": (
+                "calendar_sync_runs table is missing or unavailable. "
+                "Run supabase_calendar_events.sql in Supabase. "
+                f"Original error: {exc}"
+            ),
+            "sync_failure_count": 0,
+            "last_run": None,
+        }
     last_success = next((row for row in rows if row.get("status") == "success"), None)
     last_failed = next((row for row in rows if row.get("status") == "failed"), None)
     return {
