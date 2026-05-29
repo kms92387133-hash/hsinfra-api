@@ -1434,7 +1434,7 @@ def calendar_scope_for(name: str, url: str) -> str:
         return "personal"
     if tail == "home" or name.lower() in {"my calendar", "personal"}:
         return "personal"
-    return "shared"
+    return "other"
 
 
 def calendar_can_write(calendar, username: str, password: str) -> bool:
@@ -1491,9 +1491,12 @@ def synology_calendar_entries() -> list[dict]:
         except Exception:
             pass
         name = calendar_display_name(calendar)
+        scope = calendar_scope_for(name, calendar_url)
+        if scope == "other":
+            continue
         entries.append(
             {
-                "scope": calendar_scope_for(name, calendar_url),
+                "scope": scope,
                 "name": name,
                 "url": calendar_url,
                 "can_write": calendar_can_write(calendar, username, password),
