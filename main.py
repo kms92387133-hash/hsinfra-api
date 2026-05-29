@@ -1923,6 +1923,16 @@ def calendar_event_object(uid: str, calendar_scope: str = "shared"):
         ) from exc
 
 
+def caldav_event_attr(event, name: str) -> str:
+    try:
+        value = getattr(event, name, "")
+        if callable(value):
+            value = value()
+        return str(value or "")
+    except Exception:
+        return ""
+
+
 def calendar_event_to_json(event, calendar_meta: dict | None = None) -> dict:
     data = vevent_ics(unfold_ics(getattr(event, "data", "") or ""))
     memo = unescape_ics_text(ics_field(data, "DESCRIPTION"))
@@ -1948,6 +1958,8 @@ def calendar_event_to_json(event, calendar_meta: dict | None = None) -> dict:
         "calendar_scope": meta.get("scope", "shared"),
         "calendar_name": meta.get("name", ""),
         "calendar_url": meta.get("url", ""),
+        "href": caldav_event_attr(event, "url"),
+        "etag": caldav_event_attr(event, "etag"),
         "can_edit": bool(meta.get("can_write", True)),
         "memo": memo,
         "location": unescape_ics_text(ics_field(data, "LOCATION")),
