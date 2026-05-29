@@ -46,6 +46,10 @@ alter table public.inspections
   add column if not exists company_id uuid references public.companies(id) on delete set null,
   add column if not exists date date,
   add column if not exists category text not null default '유지보수',
+  add column if not exists calendar_event_uid text not null default '',
+  add column if not exists calendar_scope text not null default 'company_shared',
+  add column if not exists calendar_url text not null default '',
+  add column if not exists calendar_href text not null default '',
   add column if not exists created_at timestamptz not null default now();
 
 create index if not exists inspections_company_id_idx
@@ -56,6 +60,15 @@ create index if not exists inspections_date_idx
 
 create index if not exists inspections_category_idx
   on public.inspections(category);
+
+create index if not exists inspections_calendar_event_uid_idx
+  on public.inspections(calendar_event_uid);
+
+create index if not exists inspections_calendar_href_idx
+  on public.inspections(calendar_href);
+
+create index if not exists inspections_calendar_scope_idx
+  on public.inspections(calendar_scope);
 
 create table if not exists public.inspection_photos (
   id uuid primary key default gen_random_uuid(),

@@ -71,6 +71,10 @@ class InspectionCreate(BaseModel):
     company_name: str
     date: str
     category: str
+    calendar_event_uid: str = ""
+    calendar_scope: str = "company_shared"
+    calendar_url: str = ""
+    calendar_href: str = ""
 
 
 class NasPhotoSyncTarget(BaseModel):
@@ -563,6 +567,31 @@ def company_column_names() -> set[str]:
             "contract_phone",
         }
     return set(result.data[0].keys())
+
+
+def inspection_column_names() -> set[str]:
+    result = supabase.table("inspections").select("*").limit(1).execute()
+    if not result.data:
+        return {
+            "company_id",
+            "date",
+            "category",
+            "calendar_event_uid",
+            "calendar_scope",
+            "calendar_url",
+            "calendar_href",
+        }
+    return set(result.data[0].keys())
+
+
+def inspection_calendar_columns_available() -> bool:
+    columns = inspection_column_names()
+    return {
+        "calendar_event_uid",
+        "calendar_scope",
+        "calendar_url",
+        "calendar_href",
+    }.issubset(columns)
 
 
 def upsert_companies(companies: list[dict]) -> dict:
@@ -1162,16 +1191,88 @@ def create_inspection(company_id: str, inspection: InspectionUpload) -> str:
     return str(inserted.data[0]["id"])
 
 
+def inspection_calendar_event_payload(inspection: InspectionCreate) -> CalendarEventCreate:
+    company_name = inspection.company_name.strip()
+    category = normalize_inspection_category(inspection.category)
+    title = f"({category}) {company_name}".strip()
+    return CalendarEventCreate(
+        company_name=company_name,
+        title=title,
+        start_at=inspection.date,
+        end_at=inspection.date,
+        memo=f"업체명: {company_name}".strip(),
+        location=company_address_for_calendar(company_name),
+        inspectors=[],
+        all_day=True,
+        calendar_scope=normalize_calendar_scope(inspection.calendar_scope),
+    )
+
+
 def inspection_payload_from_create(inspection: InspectionCreate) -> dict:
     company_name = inspection.company_name.strip()
     if not company_name:
         raise HTTPException(status_code=400, detail="company_name is required.")
     company_id = ensure_company(company_name)
-    return {
+    payload = {
         "company_id": company_id,
         "date": inspection.date,
         "category": inspection.category,
+        "calendar_event_uid": inspection.calendar_event_uid.strip(),
+        "calendar_scope": normalize_calendar_scope(inspection.calendar_scope),
+        "calendar_url": inspection.calendar_url.strip(),
+        "calendar_href": inspection.calendar_href.strip(),
     }
+    allowed_columns = inspection_column_names()
+    return {key: value for key, value in payload.items() if key in allowed_columns}
+
+
+def attach_calendar_event_to_inspection(
+    inspection_id: str,
+    inspection: InspectionCreate,
+    existing_row: dict | None = None,
+) -> dict:
+    if not inspection_calendar_columns_available():
+        return {}
+    row = existing_row or {}
+    existing_uid = (
+        inspection.calendar_event_uid.strip()
+        or str(row.get("calendar_event_uid") or "").strip()
+    )
+    scope = normalize_calendar_scope(
+        inspection.calendar_scope or str(row.get("calendar_scope") or "company_shared")
+    )
+    event_payload = inspection_calendar_event_payload(inspection)
+    event_payload.calendar_scope = scope
+
+    if existing_uid:
+        event_result = update_synology_calendar_event(existing_uid, event_payload)
+    else:
+        event_result = create_synology_calendar_event(event_payload, calendar_scope=scope)
+
+    calendar_update = {
+        "calendar_event_uid": event_result.get("uid", existing_uid),
+        "calendar_scope": event_result.get("calendar_scope", scope),
+        "calendar_url": event_result.get("calendar_url", ""),
+        "calendar_href": event_result.get("href", event_result.get("url", "")),
+    }
+    supabase.table("inspections").update(calendar_update).eq("id", inspection_id).execute()
+    return calendar_update
+
+
+def maybe_attach_calendar_event_to_inspection(
+    inspection_id: str,
+    inspection: InspectionCreate,
+    existing_row: dict | None = None,
+) -> dict:
+    try:
+        return attach_calendar_event_to_inspection(inspection_id, inspection, existing_row)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Calendar event sync failed: {exc}",
+        ) from exc
 
 
 
@@ -2080,6 +2181,8 @@ def create_synology_calendar_event(
         "calendarName": entry["name"],
         "calendar_url": entry["url"],
         "calendarUrl": entry["url"],
+        "href": str(getattr(saved, "url", "")),
+        "etag": "",
         "can_edit": entry["can_write"],
         "canEdit": entry["can_write"],
         "url": str(getattr(saved, "url", "")),
@@ -2122,6 +2225,48 @@ def delete_synology_calendar_event(uid: str, calendar_scope: str = "company_shar
     return {"deleted": True, "uid": uid}
 
 
+def enrich_calendar_events_with_inspections(events: list[dict]) -> list[dict]:
+    uids = [item.get("uid") for item in events if item.get("uid")]
+    hrefs = [item.get("href") for item in events if item.get("href")]
+    linked_by_uid: dict[str, dict] = {}
+    linked_by_href: dict[str, dict] = {}
+    try:
+        query = supabase.table("inspections").select(
+            "id, calendar_event_uid, calendar_scope, calendar_url, calendar_href"
+        )
+        if uids:
+            rows = query.in_("calendar_event_uid", uids).execute().data or []
+            linked_by_uid = {
+                str(row.get("calendar_event_uid") or ""): row
+                for row in rows
+                if row.get("calendar_event_uid")
+            }
+        if hrefs:
+            rows = (
+                supabase.table("inspections")
+                .select("id, calendar_event_uid, calendar_scope, calendar_url, calendar_href")
+                .in_("calendar_href", hrefs)
+                .execute()
+                .data
+                or []
+            )
+            linked_by_href = {
+                str(row.get("calendar_href") or ""): row
+                for row in rows
+                if row.get("calendar_href")
+            }
+    except Exception:
+        linked_by_uid = {}
+        linked_by_href = {}
+
+    for item in events:
+        linked = linked_by_uid.get(item.get("uid", "")) or linked_by_href.get(item.get("href", ""))
+        item["inspection_id"] = str((linked or {}).get("id") or "")
+        item["inspectionLinked"] = bool(linked)
+        item["inspection_linked"] = bool(linked)
+    return events
+
+
 def list_synology_calendar_events(start: str, end: str, scopes: str = "personal,company_shared") -> list[dict]:
     start_at = parse_event_datetime(start)
     end_at = parse_event_datetime(end)
@@ -2149,6 +2294,7 @@ def list_synology_calendar_events(start: str, end: str, scopes: str = "personal,
             ) from exc
         results.extend(calendar_event_to_json(event, entry) for event in events)
 
+    results = enrich_calendar_events_with_inspections(results)
     results.sort(key=lambda item: item.get("start_at", ""))
     return results
 
@@ -2283,7 +2429,7 @@ def sync_companies_from_spreadsheet():
 def get_inspections():
     inspections = (
         supabase.table("inspections")
-        .select("id, company_id, date, category, created_at")
+        .select("*")
         .order("date", desc=True)
         .execute()
     )
@@ -2328,7 +2474,9 @@ def get_inspections():
 def create_inspection_record(inspection: InspectionCreate):
     payload = inspection_payload_from_create(inspection)
     result = supabase.table("inspections").insert(payload).execute()
-    return result.data[0]
+    row = result.data[0]
+    calendar_update = maybe_attach_calendar_event_to_inspection(str(row["id"]), inspection, row)
+    return {**row, **calendar_update}
 
 
 @app.put("/inspections/{inspection_id}")
@@ -2336,7 +2484,7 @@ def create_inspection_record(inspection: InspectionCreate):
 def update_inspection_record(inspection_id: str, inspection: InspectionCreate):
     existing = (
         supabase.table("inspections")
-        .select("id, company_id, date, category")
+        .select("*")
         .eq("id", inspection_id)
         .limit(1)
         .execute()
@@ -2388,17 +2536,46 @@ def update_inspection_record(inspection_id: str, inspection: InspectionCreate):
             detail=f"NAS folder rename failed: {exc}",
         ) from exc
 
-    return result.data[0]
+    calendar_update = maybe_attach_calendar_event_to_inspection(
+        inspection_id,
+        inspection,
+        {**existing_row, **result.data[0]},
+    )
+
+    return {**result.data[0], **calendar_update}
 
 
 @app.delete("/inspections/{inspection_id}")
 @app.delete("/api/inspections/{inspection_id}")
 def delete_inspection_record(inspection_id: str):
+    existing = (
+        supabase.table("inspections")
+        .select("*")
+        .eq("id", inspection_id)
+        .limit(1)
+        .execute()
+    )
+    calendar_delete_error = ""
+    if existing.data:
+        row = existing.data[0]
+        uid = str(row.get("calendar_event_uid") or "").strip()
+        scope = normalize_calendar_scope(str(row.get("calendar_scope") or "company_shared"))
+        if uid:
+            try:
+                delete_synology_calendar_event(uid, scope)
+            except Exception as exc:
+                calendar_delete_error = str(exc)
+
     supabase.table("inspection_photos").delete().eq(
         "inspection_id", inspection_id
     ).execute()
     supabase.table("inspections").delete().eq("id", inspection_id).execute()
-    return {"deleted": True, "id": inspection_id}
+    return {
+        "deleted": True,
+        "id": inspection_id,
+        "calendar_deleted": not calendar_delete_error,
+        "calendar_delete_error": calendar_delete_error,
+    }
 
 
 @app.get("/contacts/search")
