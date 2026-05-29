@@ -1528,7 +1528,7 @@ def carddav_config() -> tuple[str, str, str]:
     url = (
         os.getenv("SYNOLOGY_CARDDAV_URL", "")
         or os.getenv("CONTACTS_CARDDAV_URL", "")
-        or "https://contacts.hsinfra.kr/carddav/tech11/c3694919-9c09-41e9-81c8-1716f077af11"
+        or "https://hsinfra.kr:5031/carddav/tech11/62daf836-5d56-4be4-a981-5f85e7fe7003"
     ).strip()
     username = (
         os.getenv("SYNOLOGY_CARDDAV_USERNAME", "")
