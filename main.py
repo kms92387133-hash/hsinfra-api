@@ -1956,6 +1956,22 @@ def calendar_can_write(calendar, username: str, password: str) -> bool:
         return True
 
 
+def calendar_entry_debug(entry: dict) -> dict:
+    return {
+        "scope": entry.get("scope", ""),
+        "name": entry.get("name", ""),
+        "url": entry.get("url", ""),
+        "can_write": bool(entry.get("can_write")),
+    }
+
+
+def log_calendar_debug(message: str, payload: dict):
+    try:
+        print(f"[calendar-debug] {message}: {json.dumps(payload, ensure_ascii=False, default=str)}")
+    except Exception:
+        print(f"[calendar-debug] {message}: {payload}")
+
+
 def synology_calendar_entries() -> list[dict]:
     url, username, password = caldav_config()
     client = caldav.DAVClient(url=url, username=username, password=password)
@@ -2008,6 +2024,15 @@ def synology_calendar_entries() -> list[dict]:
                 )
 
     entries.sort(key=lambda item: (0 if item["scope"] == "personal" else 1 if item["scope"] == "company_shared" else 2, item["name"]))
+    log_calendar_debug(
+        "discovery",
+        {
+            "configured_url": url,
+            "shared_names": sorted(configured_shared_calendar_names()),
+            "personal_names": sorted(configured_personal_calendar_names()),
+            "calendars": [calendar_entry_debug(item) for item in entries],
+        },
+    )
     return entries
 
 
@@ -2903,17 +2928,37 @@ def sync_calendar_events_to_db(start: str, end: str, scopes: str = "personal,com
         updated = 0
         seen_keys: set[tuple[str, str, str]] = set()
         synced_events: list[dict] = []
+        discovered_entries = synology_calendar_entries()
+        discovered_calendars = [calendar_entry_debug(entry) for entry in discovered_entries]
+        processed_calendars: list[dict] = []
+        log_calendar_debug(
+            "sync_start",
+            {
+                "requested_scopes": sorted(requested),
+                "start_at": start_at.isoformat(),
+                "end_at": end_at.isoformat(),
+                "discovered_calendars": discovered_calendars,
+            },
+        )
 
-        for entry in synology_calendar_entries():
+        for entry in discovered_entries:
             if entry["scope"] not in requested:
                 continue
+            selected_calendar = calendar_entry_debug(entry)
             try:
                 events = entry["calendar"].date_search(start=start_at, end=end_at)
             except Exception as exc:
+                log_calendar_debug(
+                    "sync_calendar_query_failed",
+                    {**selected_calendar, "error": str(exc)},
+                )
                 raise HTTPException(
                     status_code=502,
                     detail=f"Synology CalDAV event query failed ({entry['name']}): {exc}",
                 ) from exc
+            selected_calendar["event_count"] = len(events)
+            processed_calendars.append(selected_calendar)
+            log_calendar_debug("sync_calendar_selected", selected_calendar)
             for raw_event in events:
                 event = calendar_event_to_json(raw_event, entry)
                 payload = calendar_event_payload_from_json(event, synced_at)
@@ -2967,7 +3012,18 @@ def sync_calendar_events_to_db(start: str, end: str, scopes: str = "personal,com
             "lastSyncedAt": synced_at,
             "scopes": sorted(requested),
             "events": sorted(synced_events, key=lambda item: item.get("start_at") or ""),
+            "discovered_calendars": discovered_calendars,
+            "processed_calendars": processed_calendars,
         }
+        log_calendar_debug(
+            "sync_result",
+            {
+                "inserted": inserted,
+                "updated": updated,
+                "deleted": deleted,
+                "processed_calendars": processed_calendars,
+            },
+        )
         record_calendar_sync_run(
             status="success",
             started_at=run_started_at,
@@ -3356,11 +3412,13 @@ def search_contacts(q: str = "", limit: int = 30):
 @app.get("/api/calendar/check")
 def check_calendar_connection():
     cal = synology_calendar()
+    configured_url, _, _ = caldav_config()
     return {
         "success": True,
         "message": "Synology Calendar connection successful.",
-        "calendar_name": getattr(cal, "name", "Unknown"),
-        "calendar_url": str(getattr(cal, "url", ""))
+        "configured_url": configured_url,
+        "calendar_name": calendar_display_name(cal),
+        "calendar_url": str(getattr(cal, "url", "")),
     }
 
 
