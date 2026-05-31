@@ -3753,6 +3753,58 @@ async def upload_inspection_photo(
         "nas_subfolder": nas_subfolder,
         "nas_filename": nas_filename,
     }
+    existing_uploaded = (
+        supabase.table("inspection_photos")
+        .select(
+            "id, inspection_id, facility_name, photo_title, file_name, storage_path, sort_order, uploaded_to_nas, local_path, local_filename, nas_folder, nas_subfolder, nas_filename, upload_status, upload_error, uploaded_at"
+        )
+        .eq("nas_folder", nas_folder)
+        .eq("nas_subfolder", nas_subfolder)
+        .eq("nas_filename", nas_filename)
+        .eq("upload_status", "uploaded")
+        .limit(1)
+        .execute()
+    )
+    if existing_uploaded.data:
+        existing_photo = existing_uploaded.data[0]
+        photo_payload = {
+            **base_photo_payload,
+            "storage_path": existing_photo.get("storage_path", ""),
+            "uploaded_to_nas": True,
+            "upload_status": "uploaded",
+            "upload_error": "",
+            "uploaded_at": existing_photo.get("uploaded_at"),
+        }
+        photo_row, metadata_saved, metadata_error = upsert_inspection_photo_metadata(
+            photo_payload
+        )
+        return {
+            "company_id": company_id,
+            "inspection_id": saved_inspection_id,
+            "uploaded_photo_count": 0,
+            "metadata_saved": metadata_saved,
+            "metadata_error": metadata_error,
+            "skipped_existing": True,
+            "uploaded_photos": [
+                {
+                    "id": str(photo_row.get("id", existing_photo.get("id", ""))),
+                    "facility_name": facility_name,
+                    "photo_title": photo_title,
+                    "file_name": nas_filename,
+                    "storage_path": existing_photo.get("storage_path", ""),
+                    "sort_order": sort_order,
+                    "local_path": local_path.strip(),
+                    "local_filename": local_filename.strip(),
+                    "nas_folder": nas_folder,
+                    "nas_subfolder": nas_subfolder,
+                    "nas_filename": nas_filename,
+                    "upload_status": "uploaded",
+                    "upload_error": "",
+                    "uploaded_at": existing_photo.get("uploaded_at"),
+                }
+            ],
+        }
+
     upsert_inspection_photo_metadata(
         {
             **base_photo_payload,
@@ -3831,4 +3883,5 @@ async def upload_inspection_photo(
             }
         ],
     }
+
 
