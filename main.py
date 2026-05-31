@@ -3753,6 +3753,15 @@ async def upload_inspection_photo(
         "nas_subfolder": nas_subfolder,
         "nas_filename": nas_filename,
     }
+    upsert_inspection_photo_metadata(
+        {
+            **base_photo_payload,
+            "storage_path": "",
+            "uploaded_to_nas": False,
+            "upload_status": "uploading",
+            "upload_error": "",
+        }
+    )
 
     try:
         nas_path = upload_photo_to_nas(
@@ -3822,3 +3831,4 @@ async def upload_inspection_photo(
             }
         ],
     }
+
