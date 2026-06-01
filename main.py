@@ -6,6 +6,7 @@ import os
 import quopri
 import re
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from threading import Lock
 from typing import List
 from urllib.error import HTTPError
@@ -41,6 +42,7 @@ supabase = create_client(
 )
 
 calendar_sync_lock = Lock()
+CALENDAR_READ_ONLY_DETAIL = "Calendar is read-only from this app. Edit events in Synology Calendar and sync again."
 
 
 class CompanyCreate(BaseModel):
@@ -2224,19 +2226,43 @@ def unescape_ics_text(value: str) -> str:
     return result.strip()
 
 
+SEOUL_TZ = ZoneInfo("Asia/Seoul")
+
 def parse_ics_datetime(value: str) -> str:
-    raw = value.strip()
+    raw = (value or "").strip()
     if not raw:
         return ""
+
+    if ":" in raw:
+        params, date_value = raw.split(":", 1)
+    else:
+        params, date_value = "", raw
+
+    if "T" not in date_value:
+        try:
+            dt = datetime.strptime(date_value[:8], "%Y%m%d")
+            return dt.date().isoformat()
+        except ValueError:
+            return ""
+
+    if date_value.endswith("Z"):
+        dt = datetime.strptime(date_value, "%Y%m%dT%H%M%SZ")
+        return dt.replace(tzinfo=timezone.utc).isoformat()
+
+    tz = SEOUL_TZ
+    match = re.search(r"TZID=([^:;]+)", params)
+    if match:
+        try:
+            tz = ZoneInfo(match.group(1))
+        except Exception:
+            tz = SEOUL_TZ
+
     try:
-        if raw.endswith("Z"):
-            parsed = datetime.strptime(raw, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-            return parsed.isoformat()
-        if "T" in raw:
-            return datetime.strptime(raw[:15], "%Y%m%dT%H%M%S").isoformat()
-        return datetime.strptime(raw[:8], "%Y%m%d").date().isoformat()
-    except Exception:
-        return raw
+        dt = datetime.strptime(date_value[:15], "%Y%m%dT%H%M%S")
+    except ValueError:
+        return ""
+
+    return dt.replace(tzinfo=tz).astimezone(timezone.utc).isoformat()
 
 
 def is_ics_all_day(data: str) -> bool:
@@ -3278,14 +3304,7 @@ def create_inspection_record(inspection: InspectionCreate):
     if "updated_at" in allowed_columns:
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
     result = supabase.table("inspections").insert(payload).execute()
-    row = result.data[0]
-    calendar_update = sync_calendar_event_to_inspection(
-        str(row["id"]),
-        inspection,
-        row,
-        allow_create=True,
-    )
-    return {**row, **calendar_update}
+    return result.data[0]
 
 
 @app.put("/inspections/{inspection_id}")
@@ -3356,14 +3375,7 @@ def update_inspection_record(inspection_id: str, inspection: InspectionCreate):
             detail=f"NAS folder rename failed: {exc}",
         ) from exc
 
-    calendar_update = sync_calendar_event_to_inspection(
-        inspection_id,
-        inspection,
-        {**existing_row, **result.data[0]},
-        allow_create=False,
-    )
-
-    return {**result.data[0], **calendar_update}
+    return result.data[0]
 
 
 @app.delete("/inspections/{inspection_id}")
@@ -3376,20 +3388,6 @@ def delete_inspection_record(inspection_id: str):
         .limit(1)
         .execute()
     )
-    calendar_delete_error = ""
-    if existing.data:
-        row = existing.data[0]
-        uid = str(row.get("calendar_event_uid") or "").strip()
-        scope = normalize_calendar_scope(str(row.get("calendar_scope") or "company_shared"))
-        if uid:
-            try:
-                delete_synology_calendar_event(uid, scope)
-            except Exception as exc:
-                calendar_delete_error = str(exc)
-
-    if existing.data:
-        mark_calendar_event_deleted_for_inspection(existing.data[0])
-
     supabase.table("inspection_photos").delete().eq(
         "inspection_id", inspection_id
     ).execute()
@@ -3397,8 +3395,8 @@ def delete_inspection_record(inspection_id: str):
     return {
         "deleted": True,
         "id": inspection_id,
-        "calendar_deleted": not calendar_delete_error,
-        "calendar_delete_error": calendar_delete_error,
+        "calendar_deleted": False,
+        "calendar_delete_error": CALENDAR_READ_ONLY_DETAIL,
     }
 
 
@@ -3546,22 +3544,19 @@ def get_calendar_diagnostics():
 @app.post("/calendar/events")
 @app.post("/api/calendar/events")
 def create_calendar_event(event: CalendarEventCreate):
-    scope = normalize_calendar_scope(event.calendar_scope or "company_shared")
-    if scope not in {"personal", "company_shared"}:
-        raise HTTPException(status_code=400, detail="calendar_scope must be personal or company_shared.")
-    return create_synology_calendar_event(event, calendar_scope=scope)
+    raise HTTPException(status_code=403, detail=CALENDAR_READ_ONLY_DETAIL)
 
 
 @app.put("/calendar/events/{uid}")
 @app.put("/api/calendar/events/{uid}")
 def update_calendar_event(uid: str, event: CalendarEventCreate):
-    return update_synology_calendar_event(uid, event)
+    raise HTTPException(status_code=403, detail=CALENDAR_READ_ONLY_DETAIL)
 
 
 @app.delete("/calendar/events/{uid}")
 @app.delete("/api/calendar/events/{uid}")
 def delete_calendar_event(uid: str, calendar_scope: str = "company_shared"):
-    return delete_synology_calendar_event(uid, calendar_scope)
+    raise HTTPException(status_code=403, detail=CALENDAR_READ_ONLY_DETAIL)
 
 
 @app.get("/schedules")
