@@ -2339,22 +2339,47 @@ def calendar_title_company_candidates(value: str) -> list[str]:
     return candidates
 
 
+def normalize_calendar_company_match_key(value: str) -> str:
+    key = normalize_company_key(value)
+    key = re.sub(r"[\W_]+", "", key, flags=re.UNICODE)
+    return key
+
+
 def company_name_if_exists(value: str) -> str:
-    for target in calendar_title_company_candidates(value):
-        try:
-            result = (
-                supabase.table("companies")
-                .select("company_name")
-                .eq("company_name", target)
-                .limit(1)
-                .execute()
-            )
-            rows = result.data or []
-            if rows:
-                return (rows[0].get("company_name") or "").strip()
-        except Exception:
-            return ""
-    return ""
+    candidates = calendar_title_company_candidates(value)
+    title_keys = [
+        normalize_calendar_company_match_key(candidate)
+        for candidate in candidates
+        if normalize_calendar_company_match_key(candidate)
+    ]
+    if not title_keys:
+        return ""
+
+    try:
+        result = supabase.table("companies").select("company_name").execute()
+    except Exception:
+        return ""
+
+    matches: list[str] = []
+    for row in result.data or []:
+        company_name = (row.get("company_name") or "").strip()
+        company_key = normalize_calendar_company_match_key(company_name)
+        if not company_name or not company_key:
+            continue
+        if any(
+            company_key == title_key or company_key in title_key
+            for title_key in title_keys
+        ):
+            matches.append(company_name)
+
+    if not matches:
+        return ""
+
+    matches.sort(
+        key=lambda name: len(normalize_calendar_company_match_key(name)),
+        reverse=True,
+    )
+    return matches[0]
 
 
 def ics_fields(data: str, name: str) -> list[str]:
