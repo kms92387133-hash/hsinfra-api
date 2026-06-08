@@ -186,13 +186,13 @@ def normalize_header(value: str) -> str:
 
 def spreadsheet_config() -> tuple[str, str, int]:
     base_url = os.getenv("SPREADSHEET_DRIVE_BASE_URL", "https://drive.hsinfra.kr").rstrip("/")
-    link_id = os.getenv("SPREADSHEET_LINK_ID", "18G9kPV3pD1fRRwbtEHtvXlbDjxEkF3r")
-    sheet_id = int(os.getenv("SPREADSHEET_SHEET_ID", "3"))
+    link_id = os.getenv("SPREADSHEET_LINK_ID", "18VoRzuXn4H7vB06uBIcr0pVZQFk3cEH")
+    sheet_id = int(os.getenv("SPREADSHEET_SHEET_ID", "2"))
     return base_url, link_id, sheet_id
 
 
 def spreadsheet_sheet_name() -> str:
-    return os.getenv("SPREADSHEET_SHEET_NAME", "app").strip() or "app"
+    return os.getenv("SPREADSHEET_SHEET_NAME", "업체리스트").strip() or "업체리스트"
 
 
 def drive_login() -> tuple[str, str]:
@@ -407,6 +407,22 @@ def find_header_index(headers: list[str], aliases: list[str]) -> int | None:
     return None
 
 
+COMPANY_SPREADSHEET_FALLBACK_COLUMNS = {
+    # 순번 / HS / 구분 / 회사명 / 주소 / 점검인원 / 주소구분 / 건물유형 /
+    # 점검 / 실무담당자 / 연락처1 / 계약담당자 / 연락처2 / 담당자3 / 연락처3
+    "company_name": 3,
+    "address": 4,
+    "address_group": 6,
+    "building_type": 7,
+    "manager": 9,
+    "phone": 10,
+    "contract_manager": 11,
+    "contract_phone": 12,
+    "third_manager": 13,
+    "third_phone": 14,
+}
+
+
 def building_type_lookup_from_spreadsheet(xlsx_bytes: bytes) -> dict[str, str]:
     lookup = {}
     rows = read_xlsx_sheet_rows_by_name(xlsx_bytes, spreadsheet_sheet_name())
@@ -466,10 +482,24 @@ def contact_memo_lookup_from_spreadsheet(xlsx_bytes: bytes) -> dict[str, str]:
     headers = rows[0]
     company_index = find_header_index(headers, ["업체명", "회사명", "업체", "회사"])
     contract_manager_index = find_header_index(headers, ["계약담당자"])
+    contract_phone_index = find_header_index(
+        headers,
+        ["계약담당자연락처", "계약담당자 연락처", "연락처2"],
+    )
+    third_manager_index = find_header_index(headers, ["담당자3"])
+    third_phone_index = find_header_index(headers, ["연락처3"])
     note_index = find_header_index(headers, ["특이사항/ 3일전협의", "특이사항", "메모"])
 
     if company_index is None:
-        return lookup
+        company_index = COMPANY_SPREADSHEET_FALLBACK_COLUMNS["company_name"]
+    if contract_manager_index is None:
+        contract_manager_index = COMPANY_SPREADSHEET_FALLBACK_COLUMNS["contract_manager"]
+    if contract_phone_index is None:
+        contract_phone_index = COMPANY_SPREADSHEET_FALLBACK_COLUMNS["contract_phone"]
+    if third_manager_index is None:
+        third_manager_index = COMPANY_SPREADSHEET_FALLBACK_COLUMNS["third_manager"]
+    if third_phone_index is None:
+        third_phone_index = COMPANY_SPREADSHEET_FALLBACK_COLUMNS["third_phone"]
 
     for row in rows[1:]:
         company_name = value_at(row, company_index)
@@ -483,6 +513,14 @@ def contact_memo_lookup_from_spreadsheet(xlsx_bytes: bytes) -> dict[str, str]:
             seen,
             label="담당자",
             name=value_at(row, contract_manager_index),
+            phone=value_at(row, contract_phone_index),
+        )
+        append_contact(
+            contacts,
+            seen,
+            label="담당자3",
+            name=value_at(row, third_manager_index),
+            phone=value_at(row, third_phone_index),
         )
 
         note = value_at(row, note_index)
@@ -505,21 +543,13 @@ def company_rows_from_spreadsheet(xlsx_bytes: bytes) -> list[dict]:
         "company_name": ["업체명", "회사명", "업체", "회사"],
         "address": ["주소"],
         "address_group": ["지역", "주소구분", "권역"],
-        "building_type": ["건물구분", "건물유형", "구분"],
+        "building_type": ["건물유형", "건물구분"],
         "manager": ["실무담당자", "점검담당자", "담당자", "담당자1", "관리자"],
-        "phone": ["실무담당자연락처", "실무담당자 연락처", "연락처", "연락처1", "전화번호"],
+        "phone": ["실무담당자연락처", "실무담당자 연락처", "연락처1", "전화번호"],
         "contract_manager": ["계약담당자"],
         "contract_phone": ["계약담당자연락처", "계약담당자 연락처", "연락처2"],
-    }
-    fallback_columns = {
-        "company_name": 2,
-        "address": 3,
-        "address_group": 4,
-        "building_type": None,
-        "manager": 8,
-        "phone": 9,
-        "contract_manager": None,
-        "contract_phone": None,
+        "third_manager": ["담당자3"],
+        "third_phone": ["연락처3"],
     }
 
     column_map = {}
@@ -530,7 +560,11 @@ def company_rows_from_spreadsheet(xlsx_bytes: bytes) -> list[dict]:
             if normalized in headers:
                 found = headers[normalized]
                 break
-        column_map[field] = found if found is not None else fallback_columns[field]
+        column_map[field] = (
+            found
+            if found is not None
+            else COMPANY_SPREADSHEET_FALLBACK_COLUMNS[field]
+        )
 
     building_type_lookup = building_type_lookup_from_spreadsheet(xlsx_bytes)
     contact_memo_lookup = contact_memo_lookup_from_spreadsheet(xlsx_bytes)
@@ -544,13 +578,15 @@ def company_rows_from_spreadsheet(xlsx_bytes: bytes) -> list[dict]:
         building_type = value_at(row, column_map["building_type"])
         if not building_type:
             building_type = building_type_lookup.get(company_name, "")
+        manager = value_at(row, column_map["manager"])
         companies.append(
             {
                 "company_name": company_name,
                 "address": value_at(row, column_map["address"]),
                 "address_group": value_at(row, column_map["address_group"]),
                 "building_type": building_type,
-                "manager": value_at(row, column_map["manager"]),
+                "manager": manager,
+                "manager_name": manager,
                 "phone": normalize_phone(value_at(row, column_map["phone"])),
                 "contract_manager": value_at(row, column_map["contract_manager"]),
                 "contract_phone": normalize_phone(
