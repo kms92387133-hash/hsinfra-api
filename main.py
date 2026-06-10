@@ -4246,6 +4246,126 @@ def sync_nas_photos(request: NasPhotoSyncRequest):
     return sync_nas_photo_metadata(request.targets)
 
 
+
+
+def uploaded_photo_rows_for_restore(inspection_id: str | None = None) -> list[dict]:
+    query = supabase.table("inspection_photos").select(INSPECTION_PHOTO_COLUMNS)
+    if inspection_id:
+        query = query.eq("inspection_id", inspection_id)
+    rows = select_inspection_photos(lambda columns: query)
+    uploaded_rows = []
+    for row in rows:
+        status = str(row.get("upload_status") or "").strip().lower()
+        storage_path = str(row.get("storage_path") or "").strip()
+        nas_filename = str(row.get("nas_filename") or row.get("file_name") or "").strip()
+        uploaded_to_nas = row.get("uploaded_to_nas") is True
+        if (status == "uploaded" or uploaded_to_nas) and (storage_path or nas_filename):
+            uploaded_rows.append(row)
+    return uploaded_rows
+
+
+@app.get("/inspections/with-uploaded-photos")
+@app.get("/api/inspections/with-uploaded-photos")
+def get_inspections_with_uploaded_photos():
+    photos = uploaded_photo_rows_for_restore()
+    inspection_ids = list({row.get("inspection_id") for row in photos if row.get("inspection_id")})
+    if not inspection_ids:
+        return []
+
+    inspections = (
+        supabase.table("inspections")
+        .select("*")
+        .in_("id", inspection_ids)
+        .order("date", desc=True)
+        .execute()
+    )
+    rows = inspections.data or []
+    company_ids = list({row.get("company_id") for row in rows if row.get("company_id")})
+    companies_by_id = {}
+    if company_ids:
+        companies = (
+            supabase.table("companies")
+            .select("id, company_name")
+            .in_("id", company_ids)
+            .execute()
+        )
+        companies_by_id = {company["id"]: company for company in companies.data or []}
+
+    counts_by_inspection_id = {}
+    for photo in photos:
+        inspection_id = photo.get("inspection_id")
+        if inspection_id:
+            counts_by_inspection_id[inspection_id] = counts_by_inspection_id.get(inspection_id, 0) + 1
+
+    result = []
+    for row in rows:
+        inspection_id = row.get("id")
+        company = companies_by_id.get(row.get("company_id"), {})
+        result.append(
+            {
+                "inspection_id": inspection_id,
+                "company_id": row.get("company_id", ""),
+                "company_name": company.get("company_name", row.get("company_name", "")),
+                "date": row.get("date", ""),
+                "category": row.get("category", ""),
+                "uploaded_photo_count": counts_by_inspection_id.get(inspection_id, 0),
+            }
+        )
+    return result
+
+
+@app.get("/inspections/{inspection_id}/uploaded-photos")
+@app.get("/api/inspections/{inspection_id}/uploaded-photos")
+def get_inspection_uploaded_photos(inspection_id: str):
+    photos = uploaded_photo_rows_for_restore(inspection_id)
+    photos.sort(
+        key=lambda row: (
+            str(row.get("facility_name") or ""),
+            int(row.get("sort_order") or 0),
+        )
+    )
+    return [
+        {
+            "photo_id": row.get("id", ""),
+            "id": row.get("id", ""),
+            "inspection_id": row.get("inspection_id", ""),
+            "facility_name": row.get("facility_name", ""),
+            "photo_title": row.get("photo_title", ""),
+            "file_name": row.get("file_name", ""),
+            "storage_path": row.get("storage_path", ""),
+            "sort_order": row.get("sort_order", 0),
+            "uploaded_to_nas": row.get("uploaded_to_nas", False),
+            "upload_status": row.get("upload_status", ""),
+            "uploaded_at": row.get("uploaded_at"),
+            "nas_folder": row.get("nas_folder", ""),
+            "nas_subfolder": row.get("nas_subfolder", ""),
+            "nas_filename": row.get("nas_filename", ""),
+            "local_path": row.get("local_path", ""),
+            "local_filename": row.get("local_filename", ""),
+        }
+        for row in photos
+    ]
+
+
+@app.post("/inspection-photos/{photo_id}/mark-missing")
+@app.post("/api/inspection-photos/{photo_id}/mark-missing")
+def mark_inspection_photo_missing(photo_id: str):
+    result = (
+        supabase.table("inspection_photos")
+        .update(
+            {
+                "upload_status": "failed",
+                "upload_error": "NAS file missing during restore",
+            }
+        )
+        .eq("id", photo_id)
+        .execute()
+    )
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Photo not found.")
+    return {"updated": True, "photo_id": photo_id, "upload_status": "failed"}
+
+
 @app.get("/inspection-photos/{photo_id}/image")
 @app.get("/api/inspection-photos/{photo_id}/image")
 def get_inspection_photo_image(photo_id: str):
