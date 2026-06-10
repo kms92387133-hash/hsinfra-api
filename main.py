@@ -2,9 +2,12 @@
 import uuid
 import io
 import json
+import logging
 import os
 import quopri
 import re
+import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from threading import Lock
@@ -16,6 +19,7 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 import caldav
+import httpx
 import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
@@ -26,7 +30,37 @@ from supabase import create_client
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logger = logging.getLogger("hsinfra")
+APP_VERSION = "photo_upload_stage_logging_v3"
+
 app = FastAPI()
+
+
+@app.get("/version")
+def version():
+    return {"version": APP_VERSION}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "version": APP_VERSION}
+
+
+@app.on_event("startup")
+def log_upload_photo_routes_on_startup():
+    logger.info("[route-map] app_version=%s", APP_VERSION)
+    print(f"[route-map] app_version={APP_VERSION}", flush=True)
+    for route in app.routes:
+        path = getattr(route, "path", "")
+        if "upload-photo" not in path:
+            continue
+        endpoint = getattr(route, "endpoint", None)
+        endpoint_name = getattr(endpoint, "__name__", str(endpoint))
+        methods = sorted(getattr(route, "methods", []) or [])
+        message = f"[route-map] path={path} methods={methods} endpoint={endpoint_name}"
+        logger.info(message)
+        print(message, flush=True)
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,6 +78,35 @@ supabase = create_client(
 calendar_sync_lock = Lock()
 CALENDAR_READ_ONLY_DETAIL = "Calendar is read-only from this app. Edit events in Synology Calendar and sync again."
 
+INSPECTION_PHOTO_COLUMNS = (
+    "id, inspection_id, facility_name, photo_title, file_name, storage_path, "
+    "sort_order, uploaded_to_nas, local_path, local_filename, nas_folder, "
+    "nas_subfolder, nas_filename, upload_status, upload_error, uploaded_at"
+)
+INSPECTION_PHOTO_BASE_COLUMNS = (
+    "id, inspection_id, facility_name, photo_title, file_name, storage_path, "
+    "sort_order, uploaded_to_nas"
+)
+INSPECTION_PHOTO_BASE_KEYS = {
+    "inspection_id",
+    "facility_name",
+    "photo_title",
+    "file_name",
+    "storage_path",
+    "sort_order",
+    "uploaded_to_nas",
+}
+INSPECTION_PHOTO_DEFAULTS = {
+    "local_path": "",
+    "local_filename": "",
+    "nas_folder": "",
+    "nas_subfolder": "",
+    "nas_filename": "",
+    "upload_status": "uploaded",
+    "upload_error": "",
+    "uploaded_at": None,
+}
+
 
 class CompanyCreate(BaseModel):
     company_name: str
@@ -54,6 +117,8 @@ class CompanyCreate(BaseModel):
     phone: str = ""
     contract_manager: str = ""
     contract_phone: str = ""
+    third_manager: str = ""
+    third_phone: str = ""
     contact_memo: str = ""
 
 
@@ -75,6 +140,7 @@ class InspectionUpload(BaseModel):
 
 class InspectionCreate(BaseModel):
     company_name: str
+    inspector_name: str = ""
     date: str
     category: str
     calendar_event_uid: str = ""
@@ -131,6 +197,45 @@ class CalendarEventCreate(BaseModel):
 def clean_path_segment(value: str) -> str:
     cleaned = "".join("_" if ch in '\\/:*?"<>|' else ch for ch in value).strip()
     return cleaned or "_"
+
+
+def unique_file_name(file_name: str, existing_names: set[str]) -> str:
+    safe_name = clean_path_segment(file_name)
+    stem, extension = os.path.splitext(safe_name)
+    if not stem:
+        stem = "photo"
+    if not extension:
+        extension = ".jpg"
+    if safe_name not in existing_names:
+        return safe_name
+    for suffix in range(2, 10000):
+        candidate = f"{stem}_{suffix}{extension}"
+        if candidate not in existing_names:
+            return candidate
+    return f"{stem}_{int(datetime.now(timezone.utc).timestamp())}{extension}"
+
+
+def unique_nas_filename(
+    nas_folder: str,
+    nas_subfolder: str,
+    file_name: str,
+    nas_existing_names: set[str] | None = None,
+) -> str:
+    existing = (
+        supabase.table("inspection_photos")
+        .select("nas_filename")
+        .eq("nas_folder", nas_folder)
+        .eq("nas_subfolder", nas_subfolder)
+        .execute()
+    )
+    existing_names = {
+        clean_path_segment(str(row.get("nas_filename") or ""))
+        for row in existing.data or []
+        if str(row.get("nas_filename") or "").strip()
+    }
+    if nas_existing_names:
+        existing_names.update(clean_path_segment(name) for name in nas_existing_names)
+    return unique_file_name(file_name, existing_names)
 
 
 def normalize_company_key(value: str) -> str:
@@ -409,7 +514,7 @@ def find_header_index(headers: list[str], aliases: list[str]) -> int | None:
 
 COMPANY_SPREADSHEET_FALLBACK_COLUMNS = {
     # 순번 / HS / 구분 / 회사명 / 주소 / 점검인원 / 주소구분 / 건물유형 /
-    # 점검 / 실무담당자 / 연락처1 / 계약담당자 / 연락처2 / 담당자3 / 연락처3
+    # 점검 / 실무담당자 / 연락처1 / 계약담당자 / 연락처2 / 담당자3 / 연락처3 / 메모
     "company_name": 3,
     "address": 4,
     "address_group": 6,
@@ -420,6 +525,7 @@ COMPANY_SPREADSHEET_FALLBACK_COLUMNS = {
     "contract_phone": 12,
     "third_manager": 13,
     "third_phone": 14,
+    "contact_memo": 15,
 }
 
 
@@ -481,54 +587,21 @@ def contact_memo_lookup_from_spreadsheet(xlsx_bytes: bytes) -> dict[str, str]:
 
     headers = rows[0]
     company_index = find_header_index(headers, ["업체명", "회사명", "업체", "회사"])
-    contract_manager_index = find_header_index(headers, ["계약담당자"])
-    contract_phone_index = find_header_index(
-        headers,
-        ["계약담당자연락처", "계약담당자 연락처", "연락처2"],
-    )
-    third_manager_index = find_header_index(headers, ["담당자3"])
-    third_phone_index = find_header_index(headers, ["연락처3"])
     note_index = find_header_index(headers, ["특이사항/ 3일전협의", "특이사항", "메모"])
 
     if company_index is None:
         company_index = COMPANY_SPREADSHEET_FALLBACK_COLUMNS["company_name"]
-    if contract_manager_index is None:
-        contract_manager_index = COMPANY_SPREADSHEET_FALLBACK_COLUMNS["contract_manager"]
-    if contract_phone_index is None:
-        contract_phone_index = COMPANY_SPREADSHEET_FALLBACK_COLUMNS["contract_phone"]
-    if third_manager_index is None:
-        third_manager_index = COMPANY_SPREADSHEET_FALLBACK_COLUMNS["third_manager"]
-    if third_phone_index is None:
-        third_phone_index = COMPANY_SPREADSHEET_FALLBACK_COLUMNS["third_phone"]
+    if note_index is None:
+        note_index = COMPANY_SPREADSHEET_FALLBACK_COLUMNS["contact_memo"]
 
     for row in rows[1:]:
         company_name = value_at(row, company_index)
         if not company_name:
             continue
 
-        contacts = []
-        seen = set()
-        append_contact(
-            contacts,
-            seen,
-            label="담당자",
-            name=value_at(row, contract_manager_index),
-            phone=value_at(row, contract_phone_index),
-        )
-        append_contact(
-            contacts,
-            seen,
-            label="담당자3",
-            name=value_at(row, third_manager_index),
-            phone=value_at(row, third_phone_index),
-        )
-
         note = value_at(row, note_index)
         if note:
-            contacts.append(f"메모: {note}")
-
-        if contacts:
-            lookup[company_name] = "\n".join(contacts)
+            lookup[company_name] = note
 
     return lookup
 
@@ -592,6 +665,8 @@ def company_rows_from_spreadsheet(xlsx_bytes: bytes) -> list[dict]:
                 "contract_phone": normalize_phone(
                     value_at(row, column_map["contract_phone"])
                 ),
+                "third_manager": value_at(row, column_map["third_manager"]),
+                "third_phone": normalize_phone(value_at(row, column_map["third_phone"])),
                 "contact_memo": contact_memo_lookup.get(company_name, ""),
             }
         )
@@ -610,6 +685,9 @@ def company_column_names() -> set[str]:
             "phone",
             "contract_manager",
             "contract_phone",
+            "third_manager",
+            "third_phone",
+            "contact_memo",
         }
     return set(result.data[0].keys())
 
@@ -627,6 +705,7 @@ def inspection_column_names() -> set[str]:
             "calendar_href",
             "calendar_sync_status",
             "calendar_sync_error",
+            "inspector_name",
             "revision",
             "updated_at",
         }
@@ -804,21 +883,30 @@ def upsert_companies(companies: list[dict]) -> dict:
         company_payload = {
             key: value for key, value in company.items() if key in allowed_columns
         }
+        existing_select = "id"
+        if "contact_memo" in allowed_columns:
+            existing_select += ", contact_memo"
         existing = (
             supabase.table("companies")
-            .select("id")
+            .select(existing_select)
             .eq("company_name", company["company_name"])
             .limit(1)
             .execute()
         )
         if existing.data:
+            existing_row = existing.data[0]
             update_payload = {
                 key: value
                 for key, value in company_payload.items()
                 if key == "company_name" or str(value).strip()
             }
+            if (
+                "contact_memo" in update_payload
+                and str(existing_row.get("contact_memo") or "").strip()
+            ):
+                update_payload.pop("contact_memo", None)
             supabase.table("companies").update(update_payload).eq(
-                "id", existing.data[0]["id"]
+                "id", existing_row["id"]
             ).execute()
             updated += 1
         else:
@@ -932,38 +1020,66 @@ def upload_photo_to_filestation(
     nas_path = f"{upload_dir}/{safe_file_name}"
 
     try:
-        response = requests.post(
-            f"{base_url}/webapi/entry.cgi",
-            params={
-                "api": "SYNO.FileStation.Upload",
-                "version": "2",
-                "method": "upload",
-                "_sid": sid,
-            },
-            data={
-                "api": "SYNO.FileStation.Upload",
-                "version": "2",
-                "method": "upload",
-                "path": upload_dir,
-                "create_parents": "true",
-                "overwrite": "true",
-                "_sid": sid,
-            },
-            files={
-                "file": (safe_file_name, content, "image/jpeg"),
-            },
-            timeout=120,
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                response = requests.post(
+                    f"{base_url}/webapi/entry.cgi",
+                    params={
+                        "api": "SYNO.FileStation.Upload",
+                        "version": "2",
+                        "method": "upload",
+                        "_sid": sid,
+                    },
+                    data={
+                        "api": "SYNO.FileStation.Upload",
+                        "version": "2",
+                        "method": "upload",
+                        "path": upload_dir,
+                        "create_parents": "true",
+                        "overwrite": "false",
+                        "_sid": sid,
+                    },
+                    files={
+                        "file": (safe_file_name, content, "image/jpeg"),
+                    },
+                    headers={"Connection": "close"},
+                    timeout=120,
+                )
+                response.raise_for_status()
+                payload = response.json()
+
+                if not payload.get("success"):
+                    print(
+                        "NAS File Station upload response failed: "
+                        f"attempt={attempt}/3, url={base_url}/webapi/entry.cgi, "
+                        f"target_path={nas_path}, file_size={len(content)}, "
+                        f"status_code={response.status_code}, response={response.text}, "
+                        "create_parents=true combines folder creation and upload"
+                    )
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"NAS File Station upload failed: {payload}",
+                    )
+
+                return nas_path
+            except HTTPException:
+                raise
+            except requests.RequestException as exc:
+                last_error = exc
+                status_code = getattr(getattr(exc, "response", None), "status_code", "")
+                response_text = getattr(getattr(exc, "response", None), "text", "")
+                print(
+                    "NAS File Station upload request failed: "
+                    f"attempt={attempt}/3, url={base_url}/webapi/entry.cgi, "
+                    f"target_path={nas_path}, file_size={len(content)}, "
+                    f"status_code={status_code}, response={response_text}, error={exc}, "
+                    "create_parents=true combines folder creation and upload"
+                )
+        raise HTTPException(
+            status_code=502,
+            detail=f"NAS File Station upload failed: {last_error}",
         )
-        response.raise_for_status()
-        payload = response.json()
-
-        if not payload.get("success"):
-            raise HTTPException(
-                status_code=502,
-                detail=f"NAS File Station upload failed: {payload}",
-            )
-
-        return nas_path
     finally:
         filestation_logout(base_url, sid)
 
@@ -1133,6 +1249,18 @@ def filestation_list(path: str) -> list[dict]:
         filestation_logout(base_url, sid)
 
 
+def filestation_file_names(path: str) -> set[str]:
+    try:
+        return {
+            clean_path_segment(str(item.get("name") or ""))
+            for item in filestation_list(path)
+            if not item.get("isdir") and str(item.get("name") or "").strip()
+        }
+    except HTTPException as exc:
+        print(f"NAS existing file list skipped: {exc.detail}")
+        return set()
+
+
 def normalize_inspection_category(value: str) -> str:
     category = value.strip()
     return "유지보수" if category == "유지점검" else category
@@ -1175,6 +1303,14 @@ def parse_nas_photo_file_name(file_name: str, fallback_order: int) -> dict | Non
             "facility_name": facility_name.strip(),
             "photo_title": photo_title.strip(),
             "sort_order": max(sort_order, 0),
+        }
+    match = re.match(r"^(.+?)\s*-\s*(.+)$", stem)
+    if match:
+        facility_name, photo_title = match.groups()
+        return {
+            "facility_name": facility_name.strip(),
+            "photo_title": photo_title.strip(),
+            "sort_order": fallback_order,
         }
     return {
         "facility_name": "기타",
@@ -1409,6 +1545,30 @@ def upload_photo_to_nas(
         ) from exc
 
 
+def normalize_inspection_photo_row(row: dict) -> dict:
+    normalized = {**INSPECTION_PHOTO_DEFAULTS, **(row or {})}
+    if not str(normalized.get("nas_filename") or "").strip():
+        normalized["nas_filename"] = str(normalized.get("file_name") or "")
+    return normalized
+
+
+def inspection_photo_base_payload(photo_payload: dict) -> dict:
+    return {
+        key: value
+        for key, value in photo_payload.items()
+        if key in INSPECTION_PHOTO_BASE_KEYS
+    }
+
+
+def select_inspection_photos(query_builder):
+    try:
+        result = query_builder(INSPECTION_PHOTO_COLUMNS).execute()
+    except Exception as exc:
+        print(f"inspection_photos full column select fallback: {exc}")
+        result = query_builder(INSPECTION_PHOTO_BASE_COLUMNS).execute()
+    return [normalize_inspection_photo_row(row) for row in result.data or []]
+
+
 def upsert_inspection_photo_metadata(photo_payload: dict) -> tuple[dict, bool, str]:
     try:
         inserted_photo = (
@@ -1419,9 +1579,16 @@ def upsert_inspection_photo_metadata(photo_payload: dict) -> tuple[dict, bool, s
             )
             .execute()
         )
-        return inserted_photo.data[0] if inserted_photo.data else {}, True, ""
+        return (
+            normalize_inspection_photo_row(inserted_photo.data[0])
+            if inserted_photo.data
+            else {},
+            True,
+            "",
+        )
     except Exception as exc:
         metadata_error = str(exc)
+        base_payload = inspection_photo_base_payload(photo_payload)
         try:
             existing_photo = (
                 supabase.table("inspection_photos")
@@ -1436,23 +1603,71 @@ def upsert_inspection_photo_metadata(photo_payload: dict) -> tuple[dict, bool, s
                 photo_id = existing_photo.data[0]["id"]
                 updated_photo = (
                     supabase.table("inspection_photos")
-                    .update(photo_payload)
+                    .update(base_payload)
                     .eq("id", photo_id)
                     .execute()
                 )
-                return (
-                    updated_photo.data[0] if updated_photo.data else {"id": photo_id},
-                    True,
-                    "",
-                )
+                row = updated_photo.data[0] if updated_photo.data else {"id": photo_id}
+                return normalize_inspection_photo_row(row), True, metadata_error
 
             inserted_photo = (
-                supabase.table("inspection_photos").insert(photo_payload).execute()
+                supabase.table("inspection_photos").insert(base_payload).execute()
             )
-            return inserted_photo.data[0] if inserted_photo.data else {}, True, ""
+            row = inserted_photo.data[0] if inserted_photo.data else {}
+            return normalize_inspection_photo_row(row), True, metadata_error
         except Exception as fallback_exc:
             return {}, False, f"{metadata_error}; fallback failed: {fallback_exc}"
 
+
+
+
+def photo_upload_log(message: str, *, error: bool = False) -> None:
+    text = f"[photo-upload] {message}"
+    if error:
+        logger.error(text)
+    else:
+        logger.info(text)
+    print(text, flush=True)
+
+def is_supabase_transient_error(exc: Exception) -> bool:
+    error_type = type(exc).__name__
+    message = str(exc).lower()
+    return (
+        isinstance(exc, (httpx.ReadError, httpx.TimeoutException, httpx.TransportError))
+        or "readerror" in error_type.lower()
+        or "timeouterror" in error_type.lower()
+        or "timeout" in message
+        or "server disconnected" in message
+        or "connection reset" in message
+    )
+
+
+def run_supabase_step_with_retry(
+    *,
+    stage: str,
+    operation,
+    inspection_id: str = "",
+    company_id: str = "",
+    max_attempts: int = 3,
+):
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            last_error = exc
+            error_type = type(exc).__name__
+            log_text = (
+                f"[photo-upload] stage={stage}, attempt={attempt}/{max_attempts}, "
+                f"inspection_id={inspection_id}, company_id={company_id}, "
+                f"error_type={error_type}, error={exc}"
+            )
+            logger.warning(log_text)
+            print(log_text, flush=True)
+            if attempt >= max_attempts or not is_supabase_transient_error(exc):
+                raise
+            time.sleep(0.6 * attempt)
+    raise last_error or RuntimeError(f"{stage} failed")
 
 def ensure_company(company_name: str) -> str:
     existing = (
@@ -1485,30 +1700,45 @@ def ensure_company(company_name: str) -> str:
 
 
 def create_inspection(company_id: str, inspection: InspectionUpload) -> str:
-    if inspection.inspection_id.strip():
-        supabase.table("inspections").update(
-            {
-                "company_id": company_id,
-                "date": inspection.date,
-                "category": inspection.category,
-            }
-        ).eq("id", inspection.inspection_id.strip()).execute()
-        return inspection.inspection_id.strip()
+    inspection_id = inspection.inspection_id.strip()
+    if inspection_id:
+        run_supabase_step_with_retry(
+            stage="create_inspection/update",
+            inspection_id=inspection_id,
+            company_id=company_id,
+            operation=lambda: supabase.table("inspections")
+            .update(
+                {
+                    "company_id": company_id,
+                    "date": inspection.date,
+                    "category": inspection.category,
+                }
+            )
+            .eq("id", inspection_id)
+            .execute(),
+        )
+        return inspection_id
 
-    existing = (
-        supabase.table("inspections")
+    existing = run_supabase_step_with_retry(
+        stage="create_inspection/select_existing",
+        inspection_id=inspection_id,
+        company_id=company_id,
+        operation=lambda: supabase.table("inspections")
         .select("id")
         .eq("company_id", company_id)
         .eq("date", inspection.date)
         .eq("category", inspection.category)
         .limit(1)
-        .execute()
+        .execute(),
     )
     if existing.data:
         return str(existing.data[0]["id"])
 
-    inserted = (
-        supabase.table("inspections")
+    inserted = run_supabase_step_with_retry(
+        stage="create_inspection/insert",
+        inspection_id=inspection_id,
+        company_id=company_id,
+        operation=lambda: supabase.table("inspections")
         .insert(
             {
                 "company_id": company_id,
@@ -1516,7 +1746,7 @@ def create_inspection(company_id: str, inspection: InspectionUpload) -> str:
                 "category": inspection.category,
             }
         )
-        .execute()
+        .execute(),
     )
 
     return str(inserted.data[0]["id"])
@@ -1555,6 +1785,7 @@ def inspection_payload_from_create(inspection: InspectionCreate) -> dict:
         "company_id": company_id,
         "date": inspection.date,
         "category": inspection.category,
+        "inspector_name": inspection.inspector_name.strip(),
         "calendar_event_uid": inspection.calendar_event_uid.strip(),
         "calendar_scope": normalize_calendar_scope(inspection.calendar_scope),
         "calendar_url": inspection.calendar_url.strip(),
@@ -1822,6 +2053,35 @@ def search_carddav_contacts(q: str = "", limit: int = 30) -> list[dict]:
         if len(contacts) >= limit:
             break
     return [contact.dict() for contact in contacts]
+
+
+CONTACT_EMAIL_NAME_CACHE: dict[str, str] = {}
+CONTACT_EMAIL_NAME_CACHE_LOADED = False
+
+
+def contact_email_name_map() -> dict[str, str]:
+    global CONTACT_EMAIL_NAME_CACHE, CONTACT_EMAIL_NAME_CACHE_LOADED
+    if CONTACT_EMAIL_NAME_CACHE_LOADED:
+        return CONTACT_EMAIL_NAME_CACHE
+    mapping: dict[str, str] = {}
+    try:
+        for card in carddav_contact_cards():
+            contact = parse_vcard(card)
+            if contact is None:
+                continue
+            email = contact.email.strip().lower()
+            name = contact.name.strip()
+            if email and name and name.lower() != email:
+                mapping[email] = name
+    except Exception as exc:
+        print(f"CardDAV attendee name enrichment skipped: {exc}")
+    CONTACT_EMAIL_NAME_CACHE = mapping
+    CONTACT_EMAIL_NAME_CACHE_LOADED = True
+    return mapping
+
+
+def contact_name_for_email(email: str) -> str:
+    return contact_email_name_map().get(email.strip().lower(), "")
 
 
 
@@ -2436,8 +2696,13 @@ def parse_attendees(data: str) -> list[dict]:
     inspectors: list[dict] = []
     for line in re.finditer(r"^ATTENDEE((?:;[^:]*)?):(.*)$", data, re.MULTILINE):
         params = line.group(1)
-        address = unescape_ics_text(line.group(2).strip()).replace("mailto:", "").strip()
-        cn_match = re.search(r";CN=(?:\"([^\"]+)\"|([^;:]+))", params)
+        address = re.sub(
+            r"^mailto:",
+            "",
+            unescape_ics_text(line.group(2).strip()),
+            flags=re.IGNORECASE,
+        ).strip()
+        cn_match = re.search(r";CN=(?:\"([^\"]+)\"|([^;:]+))", params, re.IGNORECASE)
         name = (
             unescape_ics_text(cn_match.group(1) or cn_match.group(2)).strip()
             if cn_match
@@ -2446,25 +2711,60 @@ def parse_attendees(data: str) -> list[dict]:
         email = address if EMAIL_RE.fullmatch(address) else ""
         if not email:
             continue
-        inspectors.append({"name": name or email, "email": email, "phone": ""})
+        name = name or contact_name_for_email(email) or email
+        inspectors.append({"name": name, "email": email, "phone": ""})
     return inspectors
 
 
+def enrich_inspector_names(inspectors: list[dict]) -> list[dict]:
+    enriched: list[dict] = []
+    for inspector in inspectors:
+        if not isinstance(inspector, dict):
+            continue
+        name = str(inspector.get("name") or "").strip()
+        email = str(inspector.get("email") or "").strip()
+        phone = str(inspector.get("phone") or "").strip()
+        if email and (not name or name.lower() == email.lower()):
+            name = contact_name_for_email(email) or name or email
+        enriched.append({"name": name, "email": email, "phone": phone})
+    return enriched
+
+
 def unique_inspectors(inspectors: list[dict]) -> list[dict]:
-    seen: set[tuple[str, str]] = set()
+    by_email: dict[str, dict] = {}
+    no_email: list[dict] = []
+    seen_names: set[str] = set()
     result: list[dict] = []
     for inspector in inspectors:
         name = str(inspector.get("name") or "").strip()
         email = str(inspector.get("email") or "").strip()
         phone = str(inspector.get("phone") or "").strip()
-        key = (name.lower(), email.lower())
         if not name and not email and not phone:
             continue
-        if key in seen:
+        if email:
+            key = email.lower()
+            existing = by_email.get(key)
+            if existing is None:
+                by_email[key] = {"name": name, "email": email, "phone": phone}
+                continue
+            existing_name = str(existing.get("name") or "").strip()
+            if (
+                name
+                and (not existing_name or existing_name.lower() == key)
+                and name.lower() != key
+            ):
+                existing["name"] = name
+            if phone and not str(existing.get("phone") or "").strip():
+                existing["phone"] = phone
             continue
-        seen.add(key)
-        result.append({"name": name, "email": email, "phone": phone})
-    return result
+        name_key = name.lower()
+        if name_key in seen_names:
+            continue
+        seen_names.add(name_key)
+        no_email.append({"name": name, "email": email, "phone": phone})
+    result.extend(by_email.values())
+    result.extend(no_email)
+    return enrich_inspector_names(result)
 
 
 def calendar_event_inspectors(event: CalendarEventCreate) -> list[dict]:
@@ -2744,6 +3044,7 @@ def calendar_event_payload_from_json(event: dict, synced_at: str) -> dict:
     inspectors = event.get("inspectors") or []
     if not isinstance(inspectors, list):
         inspectors = []
+    inspectors = unique_inspectors(inspectors)
     attendees = [item for item in inspectors if isinstance(item, dict) and str(item.get("email") or "").strip()]
     payload = {
         "uid": str(event.get("uid") or "").strip(),
@@ -2880,6 +3181,8 @@ def calendar_event_json_from_row(row: dict) -> dict:
             attendees = json.loads(attendees)
         except Exception:
             attendees = []
+    inspectors = unique_inspectors(inspectors) if isinstance(inspectors, list) else []
+    attendees = unique_inspectors(attendees) if isinstance(attendees, list) else []
     return {
         "uid": str(row.get("uid") or ""),
         "company_name": str(row.get("company_name") or ""),
@@ -2893,8 +3196,8 @@ def calendar_event_json_from_row(row: dict) -> dict:
         "endAt": row.get("end_at"),
         "location": str(row.get("location") or ""),
         "inspector": str(row.get("inspector") or ""),
-        "inspectors": inspectors if isinstance(inspectors, list) else [],
-        "attendees": attendees if isinstance(attendees, list) else [],
+        "inspectors": inspectors,
+        "attendees": attendees,
         "all_day": bool(row.get("all_day")),
         "allDay": bool(row.get("all_day")),
         "calendar_scope": normalize_calendar_scope(str(row.get("calendar_scope") or "company_shared")),
@@ -3335,15 +3638,12 @@ def get_inspections():
 
     photos_by_inspection_id = {}
     if inspection_ids:
-        photos = (
-            supabase.table("inspection_photos")
-            .select(
-                "id, inspection_id, facility_name, photo_title, file_name, storage_path, sort_order, uploaded_to_nas, local_path, local_filename, nas_folder, nas_subfolder, nas_filename, upload_status, upload_error, uploaded_at"
-            )
+        photos = select_inspection_photos(
+            lambda columns: supabase.table("inspection_photos")
+            .select(columns)
             .in_("inspection_id", inspection_ids)
-            .execute()
         )
-        for photo in photos.data or []:
+        for photo in photos:
             photos_by_inspection_id.setdefault(photo.get("inspection_id"), []).append(photo)
 
     for row in rows:
@@ -3766,19 +4066,37 @@ def upload_inspection(inspection: InspectionUpload):
                 detail=f"Invalid base64 photo data: {photo.file_name}",
             ) from exc
 
-        nas_path = upload_photo_to_nas(
-            company_name=company_name,
-            date=inspection.date,
-            category=inspection.category,
-            file_name=photo.file_name,
-            content=content,
-        )
         nas_folder = inspection_company_folder_name(company_name)
         nas_subfolder = inspection_subfolder_name(
             date=inspection.date,
             category=inspection.category,
         )
-        nas_filename = clean_path_segment(photo.file_name)
+        nas_existing_names = filestation_file_names(
+            inspection_folder_path(
+                company_name=company_name,
+                date=inspection.date,
+                category=inspection.category,
+            )
+        )
+        nas_filename = unique_nas_filename(
+            nas_folder,
+            nas_subfolder,
+            photo.file_name,
+            nas_existing_names=nas_existing_names,
+        )
+        print(
+            "[photo-upload] "
+            f"requested_file_name={photo.file_name}, nas_filename={nas_filename}, "
+            f"nas_folder={nas_folder}, nas_subfolder={nas_subfolder}, "
+            f"bytes={len(content)}"
+        )
+        nas_path = upload_photo_to_nas(
+            company_name=company_name,
+            date=inspection.date,
+            category=inspection.category,
+            file_name=nas_filename,
+            content=content,
+        )
 
         photo_row, _, _ = upsert_inspection_photo_metadata(
             {
@@ -3837,75 +4155,278 @@ async def upload_inspection_photo(
     local_filename: str = Form(""),
     file: UploadFile = File(...),
 ):
-    company_name = company_name.strip()
-    if not company_name:
-        raise HTTPException(status_code=400, detail="company_name is required.")
-
-    get_filestation_config()
-    company_id = ensure_company(company_name)
-    upload = InspectionUpload(
-        inspection_id=inspection_id,
-        company_name=company_name,
-        date=date,
-        category=category,
-        photos=[],
-    )
-    saved_inspection_id = create_inspection(company_id, upload)
-    content = await file.read()
-    nas_folder = inspection_company_folder_name(company_name)
-    nas_subfolder = inspection_subfolder_name(date=date, category=category)
-    nas_filename = clean_path_segment(file_name)
-    base_photo_payload = {
-        "inspection_id": saved_inspection_id,
-        "facility_name": facility_name,
-        "photo_title": photo_title,
-        "file_name": nas_filename,
-        "sort_order": sort_order,
-        "local_path": local_path.strip(),
-        "local_filename": local_filename.strip(),
-        "nas_folder": nas_folder,
-        "nas_subfolder": nas_subfolder,
-        "nas_filename": nas_filename,
-    }
-    existing_uploaded = (
-        supabase.table("inspection_photos")
-        .select(
-            "id, inspection_id, facility_name, photo_title, file_name, storage_path, sort_order, uploaded_to_nas, local_path, local_filename, nas_folder, nas_subfolder, nas_filename, upload_status, upload_error, uploaded_at"
+    stage = "request_received"
+    company_id = ""
+    saved_inspection_id = inspection_id.strip()
+    content = b""
+    try:
+        photo_upload_log(
+            "stage=request_received "
+            f"inspection_id={inspection_id}, company_name={company_name}, "
+            f"file_name={file_name}, content_type={file.content_type}, "
+            f"facility_name={facility_name}, photo_title={photo_title}, "
+            f"sort_order={sort_order}, local_path={local_path}, "
+            f"local_filename={local_filename}"
         )
-        .eq("nas_folder", nas_folder)
-        .eq("nas_subfolder", nas_subfolder)
-        .eq("nas_filename", nas_filename)
-        .eq("upload_status", "uploaded")
-        .limit(1)
-        .execute()
-    )
-    if existing_uploaded.data:
-        existing_photo = existing_uploaded.data[0]
+        stage = "request_parse"
+        company_name = company_name.strip()
+        if not company_name:
+            raise HTTPException(
+                status_code=400,
+                detail="업로드 실패(stage=request_parse): company_name is required.",
+            )
+
+        content = await file.read()
+        photo_upload_log(
+            "stage=parse_done "
+            f"inspection_id={inspection_id}, company_name={company_name}, "
+            f"file_name={file_name}, file_size={len(content)}, "
+            f"content_type={file.content_type}, facility_name={facility_name}, "
+            f"photo_title={photo_title}, sort_order={sort_order}"
+        )
+
+        stage = "filestation_config"
+        get_filestation_config()
+
+        stage = "ensure_company"
+        company_id = ensure_company(company_name)
+        photo_upload_log(
+            f"stage=ensure_company done inspection_id={inspection_id}, company_id={company_id}"
+        )
+
+        upload = InspectionUpload(
+            inspection_id=inspection_id,
+            company_name=company_name,
+            date=date,
+            category=category,
+            photos=[],
+        )
+
+        stage = "create_inspection"
+        try:
+            photo_upload_log(
+                f"stage=create_inspection start inspection_id={inspection_id}, company_id={company_id}"
+            )
+            saved_inspection_id = create_inspection(company_id, upload)
+            photo_upload_log(
+                f"stage=create_inspection done inspection_id={saved_inspection_id}, company_id={company_id}"
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            photo_upload_log(
+                f"stage=create_inspection failed inspection_id={inspection_id}, company_id={company_id}, "
+                f"error_type={type(exc).__name__}, error={exc}",
+                error=True,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"점검 저장 실패(stage=create_inspection): {exc}",
+            ) from exc
+
+        nas_folder = inspection_company_folder_name(company_name)
+        nas_subfolder = inspection_subfolder_name(date=date, category=category)
+        stage = "nas_prepare"
+        try:
+            photo_upload_log(
+                f"stage=nas_prepare start inspection_id={saved_inspection_id}, company_id={company_id}, "
+                f"nas_folder={nas_folder}, nas_subfolder={nas_subfolder}"
+            )
+            nas_existing_names = filestation_file_names(
+                inspection_folder_path(
+                    company_name=company_name, date=date, category=category
+                )
+            )
+            nas_filename = unique_nas_filename(
+                nas_folder,
+                nas_subfolder,
+                file_name,
+                nas_existing_names=nas_existing_names,
+            )
+            photo_upload_log(
+                f"stage=nas_prepare done inspection_id={saved_inspection_id}, company_id={company_id}, "
+                f"nas_filename={nas_filename}"
+            )
+        except HTTPException as exc:
+            photo_upload_log(
+                f"stage=nas_prepare failed inspection_id={saved_inspection_id}, company_id={company_id}, "
+                f"error_type={type(exc).__name__}, error={exc.detail}",
+                error=True,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"NAS 업로드 실패(stage=nas_prepare): {exc.detail}",
+            ) from exc
+        except Exception as exc:
+            photo_upload_log(
+                f"stage=nas_prepare failed inspection_id={saved_inspection_id}, company_id={company_id}, "
+                f"error_type={type(exc).__name__}, error={exc}",
+                error=True,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=f"NAS 업로드 실패(stage=nas_prepare): {exc}",
+            ) from exc
+
+        photo_upload_log(
+            f"requested_file_name={file_name}, nas_filename={nas_filename}, "
+            f"nas_folder={nas_folder}, nas_subfolder={nas_subfolder}, bytes={len(content)}"
+        )
+        base_photo_payload = {
+            "inspection_id": saved_inspection_id,
+            "facility_name": facility_name,
+            "photo_title": photo_title,
+            "file_name": nas_filename,
+            "sort_order": sort_order,
+            "local_path": local_path.strip(),
+            "local_filename": local_filename.strip(),
+            "nas_folder": nas_folder,
+            "nas_subfolder": nas_subfolder,
+            "nas_filename": nas_filename,
+        }
+        existing_uploaded_rows = []
+        try:
+            existing_uploaded_rows = select_inspection_photos(
+                lambda columns: supabase.table("inspection_photos")
+                .select(columns)
+                .eq("nas_folder", nas_folder)
+                .eq("nas_subfolder", nas_subfolder)
+                .eq("nas_filename", nas_filename)
+                .eq("upload_status", "uploaded")
+                .limit(1)
+            )
+        except Exception as exc:
+            photo_upload_log(
+                f"stage=metadata_lookup skipped inspection_id={saved_inspection_id}, "
+                f"company_id={company_id}, error_type={type(exc).__name__}, error={exc}",
+                error=True,
+            )
+        if existing_uploaded_rows:
+            existing_photo = existing_uploaded_rows[0]
+            photo_payload = {
+                **base_photo_payload,
+                "storage_path": existing_photo.get("storage_path", ""),
+                "uploaded_to_nas": True,
+                "upload_status": "uploaded",
+                "upload_error": "",
+                "uploaded_at": existing_photo.get("uploaded_at"),
+            }
+            photo_row, metadata_saved, metadata_error = upsert_inspection_photo_metadata(
+                photo_payload
+            )
+            return {
+                "company_id": company_id,
+                "inspection_id": saved_inspection_id,
+                "uploaded_photo_count": 0,
+                "metadata_saved": metadata_saved,
+                "metadata_error": metadata_error,
+                "skipped_existing": True,
+                "uploaded_photos": [
+                    {
+                        "id": str(photo_row.get("id", existing_photo.get("id", ""))),
+                        "facility_name": facility_name,
+                        "photo_title": photo_title,
+                        "file_name": nas_filename,
+                        "storage_path": existing_photo.get("storage_path", ""),
+                        "sort_order": sort_order,
+                        "local_path": local_path.strip(),
+                        "local_filename": local_filename.strip(),
+                        "nas_folder": nas_folder,
+                        "nas_subfolder": nas_subfolder,
+                        "nas_filename": nas_filename,
+                        "upload_status": "uploaded",
+                        "upload_error": "",
+                        "uploaded_at": existing_photo.get("uploaded_at"),
+                    }
+                ],
+            }
+
+        stage = "metadata_uploading"
+        upsert_inspection_photo_metadata(
+            {
+                **base_photo_payload,
+                "storage_path": "",
+                "uploaded_to_nas": False,
+                "upload_status": "uploading",
+                "upload_error": "",
+            }
+        )
+
+        stage = "nas_upload"
+        try:
+            photo_upload_log(
+                f"stage=nas_upload start inspection_id={saved_inspection_id}, company_id={company_id}, "
+                f"nas_filename={nas_filename}, bytes={len(content)}"
+            )
+            nas_path = upload_photo_to_nas(
+                company_name=company_name,
+                date=date,
+                category=category,
+                file_name=nas_filename,
+                content=content,
+            )
+            photo_upload_log(
+                f"stage=nas_upload done inspection_id={saved_inspection_id}, company_id={company_id}, nas_path={nas_path}"
+            )
+        except HTTPException as exc:
+            upload_error = f"NAS 업로드 실패(stage=nas_upload): {exc.detail}"
+            photo_upload_log(
+                f"stage=nas_upload failed inspection_id={saved_inspection_id}, company_id={company_id}, "
+                f"error_type={type(exc).__name__}, error={exc.detail}",
+                error=True,
+            )
+            failed_payload = {
+                **base_photo_payload,
+                "storage_path": "",
+                "uploaded_to_nas": False,
+                "upload_status": "failed",
+                "upload_error": upload_error,
+            }
+            upsert_inspection_photo_metadata(failed_payload)
+            raise HTTPException(status_code=502, detail=upload_error) from exc
+        except Exception as exc:
+            upload_error = f"NAS 업로드 실패(stage=nas_upload): {exc}"
+            photo_upload_log(
+                f"stage=nas_upload failed inspection_id={saved_inspection_id}, company_id={company_id}, "
+                f"error_type={type(exc).__name__}, error={exc}",
+                error=True,
+            )
+            failed_payload = {
+                **base_photo_payload,
+                "storage_path": "",
+                "uploaded_to_nas": False,
+                "upload_status": "failed",
+                "upload_error": upload_error,
+            }
+            upsert_inspection_photo_metadata(failed_payload)
+            raise HTTPException(status_code=502, detail=upload_error) from exc
+
+        stage = "metadata_uploaded"
         photo_payload = {
             **base_photo_payload,
-            "storage_path": existing_photo.get("storage_path", ""),
+            "storage_path": nas_path,
             "uploaded_to_nas": True,
             "upload_status": "uploaded",
             "upload_error": "",
-            "uploaded_at": existing_photo.get("uploaded_at"),
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
         }
         photo_row, metadata_saved, metadata_error = upsert_inspection_photo_metadata(
             photo_payload
         )
+
         return {
             "company_id": company_id,
             "inspection_id": saved_inspection_id,
-            "uploaded_photo_count": 0,
+            "uploaded_photo_count": 1,
             "metadata_saved": metadata_saved,
             "metadata_error": metadata_error,
-            "skipped_existing": True,
             "uploaded_photos": [
                 {
-                    "id": str(photo_row.get("id", existing_photo.get("id", ""))),
+                    "id": str(photo_row.get("id", "")),
                     "facility_name": facility_name,
                     "photo_title": photo_title,
                     "file_name": nas_filename,
-                    "storage_path": existing_photo.get("storage_path", ""),
+                    "storage_path": nas_path,
                     "sort_order": sort_order,
                     "local_path": local_path.strip(),
                     "local_filename": local_filename.strip(),
@@ -3914,88 +4435,26 @@ async def upload_inspection_photo(
                     "nas_filename": nas_filename,
                     "upload_status": "uploaded",
                     "upload_error": "",
-                    "uploaded_at": existing_photo.get("uploaded_at"),
                 }
             ],
         }
-
-    upsert_inspection_photo_metadata(
-        {
-            **base_photo_payload,
-            "storage_path": "",
-            "uploaded_to_nas": False,
-            "upload_status": "uploading",
-            "upload_error": "",
-        }
-    )
-
-    try:
-        nas_path = upload_photo_to_nas(
-            company_name=company_name,
-            date=date,
-            category=category,
-            file_name=nas_filename,
-            content=content,
-        )
     except HTTPException as exc:
-        failed_payload = {
-            **base_photo_payload,
-            "storage_path": "",
-            "uploaded_to_nas": False,
-            "upload_status": "failed",
-            "upload_error": str(exc.detail),
-        }
-        upsert_inspection_photo_metadata(failed_payload)
+        photo_upload_log(
+            f"stage={stage} http_failed inspection_id={saved_inspection_id}, company_id={company_id}, "
+            f"error_type={type(exc).__name__}, error={exc.detail}",
+            error=True,
+        )
         raise
     except Exception as exc:
-        failed_payload = {
-            **base_photo_payload,
-            "storage_path": "",
-            "uploaded_to_nas": False,
-            "upload_status": "failed",
-            "upload_error": str(exc),
-        }
-        upsert_inspection_photo_metadata(failed_payload)
+        tb = traceback.format_exc()
+        photo_upload_log(
+            f"stage=unexpected_failed last_stage={stage}, inspection_id={saved_inspection_id}, "
+            f"company_id={company_id}, error_type={type(exc).__name__}, error={exc}, traceback={tb}",
+            error=True,
+        )
         raise HTTPException(
             status_code=502,
-            detail=f"NAS File Station upload failed: {exc}",
+            detail=f"업로드 실패(stage=unexpected_failed,last_stage={stage}): {exc}",
         ) from exc
-
-    photo_payload = {
-        **base_photo_payload,
-        "storage_path": nas_path,
-        "uploaded_to_nas": True,
-        "upload_status": "uploaded",
-        "upload_error": "",
-        "uploaded_at": datetime.now(timezone.utc).isoformat(),
-    }
-    photo_row, metadata_saved, metadata_error = upsert_inspection_photo_metadata(
-        photo_payload
-    )
-
-    return {
-        "company_id": company_id,
-        "inspection_id": saved_inspection_id,
-        "uploaded_photo_count": 1,
-        "metadata_saved": metadata_saved,
-        "metadata_error": metadata_error,
-        "uploaded_photos": [
-            {
-                "id": str(photo_row.get("id", "")),
-                "facility_name": facility_name,
-                "photo_title": photo_title,
-                "file_name": nas_filename,
-                "storage_path": nas_path,
-                "sort_order": sort_order,
-                "local_path": local_path.strip(),
-                "local_filename": local_filename.strip(),
-                "nas_folder": nas_folder,
-                "nas_subfolder": nas_subfolder,
-                "nas_filename": nas_filename,
-                "upload_status": "uploaded",
-                "upload_error": "",
-            }
-        ],
-    }
 
 
