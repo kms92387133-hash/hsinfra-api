@@ -32,7 +32,7 @@ load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 logger = logging.getLogger("hsinfra")
-APP_VERSION = "photo_upload_filestation_diagnostics_v4"
+APP_VERSION = "photo_upload_webdav_fallback_v5"
 
 app = FastAPI()
 
@@ -1633,41 +1633,119 @@ def webdav_request(
     relative_path: str,
     data: bytes | None = None,
     content_type: str | None = None,
-) -> None:
+    *,
+    success_codes: set[int] | None = None,
+    existing_codes: set[int] | None = None,
+    stage: str = "webdav_request",
+    target_path: str = "",
+) -> tuple[int, str]:
     base_url, username, password = get_nas_config()
-    opener = webdav_opener(base_url, username, password)
-    headers = {}
+    target_url = webdav_url(base_url, relative_path)
+    headers = {"Connection": "close"}
     if content_type:
         headers["Content-Type"] = content_type
+    success_codes = success_codes or {200, 201, 204}
+    existing_codes = existing_codes or set()
 
-    request = Request(
-        webdav_url(base_url, relative_path),
-        data=data,
-        headers=headers,
-        method=method,
+    photo_upload_log(
+        f"stage={stage} start method={method}, target_url={target_url}, "
+        f"target_path={target_path or relative_path}, bytes={len(data or b'')}"
     )
-
     try:
-        with opener.open(request, timeout=30) as response:
-            if response.status >= 400:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"NAS WebDAV {method} failed: HTTP {response.status}",
-                )
-    except HTTPError as exc:
-        if method == "MKCOL" and exc.code in (301, 405):
-            return
+        response = requests.request(
+            method,
+            target_url,
+            data=data,
+            headers=headers,
+            auth=(username, password),
+            timeout=120,
+        )
+    except requests.RequestException as exc:
+        photo_upload_log(
+            f"stage={stage} failed method={method}, target_url={target_url}, "
+            f"target_path={target_path or relative_path}, error_type={type(exc).__name__}, error={exc}",
+            error=True,
+        )
         raise HTTPException(
             status_code=502,
-            detail=f"NAS WebDAV {method} failed: HTTP {exc.code}",
+            detail=f"NAS WebDAV {method} failed: {exc}",
         ) from exc
 
+    response_text = response.text
+    if response.status_code in success_codes:
+        photo_upload_log(
+            f"stage={stage} done method={method}, target_url={target_url}, "
+            f"target_path={target_path or relative_path}, status_code={response.status_code}, "
+            f"response={response_text}"
+        )
+        return response.status_code, response_text
 
-def ensure_nas_dirs(relative_dir: str) -> None:
+    if response.status_code in existing_codes:
+        photo_upload_log(
+            f"stage={stage} exists method={method}, target_url={target_url}, "
+            f"target_path={target_path or relative_path}, status_code={response.status_code}, "
+            f"response={response_text}"
+        )
+        return response.status_code, response_text
+
+    photo_upload_log(
+        f"stage={stage} failed method={method}, target_url={target_url}, "
+        f"target_path={target_path or relative_path}, status_code={response.status_code}, "
+        f"response={response_text}",
+        error=True,
+    )
+    raise HTTPException(
+        status_code=502,
+        detail=f"NAS WebDAV {method} failed: HTTP {response.status_code}: {response_text}",
+    )
+
+
+def ensure_nas_dirs(relative_dir: str, *, nas_dir: str = "") -> None:
     current = ""
+    nas_current = ""
     for part in [item for item in relative_dir.split("/") if item]:
         current = f"{current}/{part}" if current else part
-        webdav_request("MKCOL", current)
+        nas_current = f"{nas_current}/{part}" if nas_current else part
+        target_path = f"{nas_dir.rstrip('/')}/{nas_current}" if nas_dir else current
+        webdav_request(
+            "MKCOL",
+            current,
+            success_codes={200, 201, 204},
+            existing_codes={405, 409},
+            stage="webdav_mkdir",
+            target_path=target_path,
+        )
+
+
+def upload_photo_to_webdav(
+    *,
+    company_name: str,
+    date: str,
+    category: str,
+    file_name: str,
+    content: bytes,
+) -> str:
+    _, _, _, root_path = get_filestation_config()
+    inspection_dir = inspection_folder_name(
+        company_name=company_name,
+        date=date,
+        category=category,
+    )
+    safe_file_name = clean_path_segment(file_name)
+    relative_path = f"{inspection_dir}/{safe_file_name}"
+    nas_path = f"{root_path}/{relative_path}"
+
+    ensure_nas_dirs(inspection_dir, nas_dir=root_path)
+    webdav_request(
+        "PUT",
+        relative_path,
+        data=content,
+        content_type="image/jpeg",
+        success_codes={200, 201, 204},
+        stage="webdav_upload",
+        target_path=nas_path,
+    )
+    return nas_path
 
 
 def upload_photo_to_nas(
@@ -1686,13 +1764,49 @@ def upload_photo_to_nas(
             file_name=file_name,
             content=content,
         )
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"NAS File Station upload failed: {exc}",
-        ) from exc
+    except Exception as filestation_exc:
+        filestation_error = (
+            filestation_exc.detail
+            if isinstance(filestation_exc, HTTPException)
+            else str(filestation_exc)
+        )
+        photo_upload_log(
+            f"stage=webdav_fallback start reason=file_station_failed, "
+            f"error_type={type(filestation_exc).__name__}, error={filestation_error}",
+            error=True,
+        )
+        try:
+            nas_path = upload_photo_to_webdav(
+                company_name=company_name,
+                date=date,
+                category=category,
+                file_name=file_name,
+                content=content,
+            )
+            photo_upload_log(
+                f"stage=webdav_fallback done status=uploaded, nas_path={nas_path}, "
+                f"file_station_error={filestation_error}"
+            )
+            return nas_path
+        except Exception as webdav_exc:
+            webdav_error = (
+                webdav_exc.detail
+                if isinstance(webdav_exc, HTTPException)
+                else str(webdav_exc)
+            )
+            photo_upload_log(
+                f"stage=webdav_fallback failed file_station_error={filestation_error}, "
+                f"webdav_error_type={type(webdav_exc).__name__}, webdav_error={webdav_error}",
+                error=True,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "NAS upload failed: "
+                    f"File Station error={filestation_error}; "
+                    f"WebDAV error={webdav_error}"
+                ),
+            ) from webdav_exc
 
 
 def normalize_inspection_photo_row(row: dict) -> dict:
