@@ -1756,14 +1756,13 @@ def upload_photo_to_nas(
     file_name: str,
     content: bytes,
 ) -> str:
-    try:
-        return upload_photo_to_filestation(
-            company_name=company_name,
-            date=date,
-            category=category,
-            file_name=file_name,
-            content=content,
-        )
+    return upload_photo_to_webdav(
+        company_name=company_name,
+        date=date,
+        category=category,
+        file_name=file_name,
+        content=content,
+    )
     except Exception as filestation_exc:
         filestation_error = (
             filestation_exc.detail
