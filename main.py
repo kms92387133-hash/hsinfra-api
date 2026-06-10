@@ -32,7 +32,7 @@ load_dotenv(os.path.join(BASE_DIR, ".env"), override=True)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 logger = logging.getLogger("hsinfra")
-APP_VERSION = "photo_upload_stage_logging_v3"
+APP_VERSION = "photo_upload_filestation_diagnostics_v4"
 
 app = FastAPI()
 
@@ -956,8 +956,28 @@ def get_filestation_config() -> tuple[str, str, str, str]:
     return base_url, username, password, root_path
 
 
+def mask_sid(sid: str) -> str:
+    if not sid:
+        return ""
+    if len(sid) <= 8:
+        return "***"
+    return f"{sid[:4]}...{sid[-4:]}"
+
+
 def filestation_login() -> tuple[str, str]:
     base_url, username, password, _ = get_filestation_config()
+    login_params = {
+        "api": "SYNO.API.Auth",
+        "version": "7",
+        "method": "login",
+        "account": username,
+        "passwd": "***",
+        "session": "FileStation",
+        "format": "sid",
+    }
+    photo_upload_log(
+        f"stage=filestation_login start url={base_url}/webapi/entry.cgi, params={login_params}"
+    )
     response = requests.get(
         f"{base_url}/webapi/entry.cgi",
         params={
@@ -975,12 +995,20 @@ def filestation_login() -> tuple[str, str]:
     payload = response.json()
 
     if not payload.get("success"):
+        photo_upload_log(
+            f"stage=filestation_login failed status_code={response.status_code}, response={response.text}",
+            error=True,
+        )
         raise HTTPException(
             status_code=502,
             detail=f"NAS File Station login failed: {payload}",
         )
 
-    return base_url, payload["data"]["sid"]
+    sid = payload["data"]["sid"]
+    photo_upload_log(
+        f"stage=filestation_login done status_code={response.status_code}, sid={mask_sid(sid)}"
+    )
+    return base_url, sid
 
 
 def filestation_logout(base_url: str, sid: str) -> None:
@@ -998,6 +1026,97 @@ def filestation_logout(base_url: str, sid: str) -> None:
         )
     except Exception:
         pass
+
+
+def filestation_list_with_session(base_url: str, sid: str, path: str) -> list[dict]:
+    params = {
+        "api": "SYNO.FileStation.List",
+        "version": "2",
+        "method": "list",
+        "folder_path": path,
+        "additional": "real_path,size,time",
+        "_sid": sid,
+    }
+    response = requests.get(
+        f"{base_url}/webapi/entry.cgi",
+        params=params,
+        timeout=60,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not payload.get("success"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"NAS File Station list failed: {payload}",
+        )
+    return payload.get("data", {}).get("files", []) or []
+
+
+def filestation_log_root_path_exists(base_url: str, sid: str, root_path: str) -> None:
+    try:
+        filestation_list_with_session(base_url, sid, root_path)
+        photo_upload_log(f"stage=filestation_root_check done root_path={root_path}")
+    except Exception as exc:
+        photo_upload_log(
+            f"stage=filestation_root_check failed root_path={root_path}, "
+            f"error_type={type(exc).__name__}, error={exc}",
+            error=True,
+        )
+        raise
+
+
+def filestation_ensure_folder(base_url: str, sid: str, parent_path: str, folder_name: str) -> None:
+    safe_folder_name = clean_path_segment(folder_name)
+    target_path = f"{parent_path.rstrip('/')}/{safe_folder_name}"
+    params = {
+        "api": "SYNO.FileStation.CreateFolder",
+        "version": "2",
+        "method": "create",
+        "_sid": sid,
+    }
+    data = {
+        "folder_path": parent_path,
+        "name": safe_folder_name,
+        "force_parent": "false",
+    }
+    log_params = {**params, "_sid": mask_sid(sid)}
+    photo_upload_log(
+        f"stage=filestation_mkdir start url={base_url}/webapi/entry.cgi, "
+        f"params={log_params}, data={data}, target_path={target_path}"
+    )
+    response = requests.post(
+        f"{base_url}/webapi/entry.cgi",
+        params=params,
+        data=data,
+        headers={"Connection": "close"},
+        timeout=60,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("success"):
+        photo_upload_log(
+            f"stage=filestation_mkdir done target_path={target_path}, status_code={response.status_code}, response={response.text}"
+        )
+        return
+
+    try:
+        filestation_list_with_session(base_url, sid, target_path)
+        photo_upload_log(
+            f"stage=filestation_mkdir exists target_path={target_path}, "
+            f"status_code={response.status_code}, response={response.text}"
+        )
+        return
+    except Exception as list_exc:
+        photo_upload_log(
+            f"stage=filestation_mkdir failed target_path={target_path}, "
+            f"status_code={response.status_code}, response={response.text}, "
+            f"verify_error_type={type(list_exc).__name__}, verify_error={list_exc}",
+            error=True,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"NAS File Station mkdir failed: {payload}",
+        ) from list_exc
 
 
 def upload_photo_to_filestation(
@@ -1020,26 +1139,51 @@ def upload_photo_to_filestation(
     nas_path = f"{upload_dir}/{safe_file_name}"
 
     try:
+        photo_upload_log(
+            f"stage=filestation_upload_prepare root_path={root_path}, upload_dir={upload_dir}, "
+            f"nas_path={nas_path}, file_name={safe_file_name}, file_size={len(content)}"
+        )
+        filestation_log_root_path_exists(base_url, sid, root_path)
+        company_folder, inspection_folder = inspection_dir.split("/", 1)
+        filestation_ensure_folder(base_url, sid, root_path, company_folder)
+        filestation_ensure_folder(
+            base_url, sid, f"{root_path}/{company_folder}", inspection_folder
+        )
+
         last_error: Exception | None = None
         for attempt in range(1, 4):
+            params = {
+                "api": "SYNO.FileStation.Upload",
+                "version": "2",
+                "method": "upload",
+                "_sid": sid,
+            }
+            data = {
+                "api": "SYNO.FileStation.Upload",
+                "version": "2",
+                "method": "upload",
+                "path": upload_dir,
+                "overwrite": "false",
+                "_sid": sid,
+            }
+            log_params = {**params, "_sid": mask_sid(sid)}
+            log_data = {**data, "_sid": mask_sid(sid)}
+            files_log = {
+                "file": {
+                    "filename": safe_file_name,
+                    "content_type": "image/jpeg",
+                    "size": len(content),
+                }
+            }
+            photo_upload_log(
+                f"stage=filestation_upload attempt={attempt}/3 url={base_url}/webapi/entry.cgi, "
+                f"params={log_params}, data={log_data}, files={files_log}, target_path={nas_path}"
+            )
             try:
                 response = requests.post(
                     f"{base_url}/webapi/entry.cgi",
-                    params={
-                        "api": "SYNO.FileStation.Upload",
-                        "version": "2",
-                        "method": "upload",
-                        "_sid": sid,
-                    },
-                    data={
-                        "api": "SYNO.FileStation.Upload",
-                        "version": "2",
-                        "method": "upload",
-                        "path": upload_dir,
-                        "create_parents": "true",
-                        "overwrite": "false",
-                        "_sid": sid,
-                    },
+                    params=params,
+                    data=data,
                     files={
                         "file": (safe_file_name, content, "image/jpeg"),
                     },
@@ -1050,18 +1194,23 @@ def upload_photo_to_filestation(
                 payload = response.json()
 
                 if not payload.get("success"):
-                    print(
-                        "NAS File Station upload response failed: "
+                    photo_upload_log(
+                        "stage=filestation_upload response_failed "
                         f"attempt={attempt}/3, url={base_url}/webapi/entry.cgi, "
                         f"target_path={nas_path}, file_size={len(content)}, "
                         f"status_code={response.status_code}, response={response.text}, "
-                        "create_parents=true combines folder creation and upload"
+                        "create_parents=false; mkdir was called separately",
+                        error=True,
                     )
                     raise HTTPException(
                         status_code=502,
                         detail=f"NAS File Station upload failed: {payload}",
                     )
 
+                photo_upload_log(
+                    f"stage=filestation_upload done attempt={attempt}/3, target_path={nas_path}, "
+                    f"status_code={response.status_code}, response={response.text}"
+                )
                 return nas_path
             except HTTPException:
                 raise
@@ -1069,12 +1218,13 @@ def upload_photo_to_filestation(
                 last_error = exc
                 status_code = getattr(getattr(exc, "response", None), "status_code", "")
                 response_text = getattr(getattr(exc, "response", None), "text", "")
-                print(
-                    "NAS File Station upload request failed: "
+                photo_upload_log(
+                    "stage=filestation_upload request_failed "
                     f"attempt={attempt}/3, url={base_url}/webapi/entry.cgi, "
                     f"target_path={nas_path}, file_size={len(content)}, "
                     f"status_code={status_code}, response={response_text}, error={exc}, "
-                    "create_parents=true combines folder creation and upload"
+                    "create_parents=false; mkdir was called separately",
+                    error=True,
                 )
         raise HTTPException(
             status_code=502,
@@ -4456,5 +4606,6 @@ async def upload_inspection_photo(
             status_code=502,
             detail=f"업로드 실패(stage=unexpected_failed,last_stage={stage}): {exc}",
         ) from exc
+
 
 
