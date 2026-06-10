@@ -1763,51 +1763,8 @@ def upload_photo_to_nas(
         file_name=file_name,
         content=content,
     )
-    except Exception as filestation_exc:
-        filestation_error = (
-            filestation_exc.detail
-            if isinstance(filestation_exc, HTTPException)
-            else str(filestation_exc)
-        )
-        photo_upload_log(
-            f"stage=webdav_fallback start reason=file_station_failed, "
-            f"error_type={type(filestation_exc).__name__}, error={filestation_error}",
-            error=True,
-        )
-        try:
-            nas_path = upload_photo_to_webdav(
-                company_name=company_name,
-                date=date,
-                category=category,
-                file_name=file_name,
-                content=content,
-            )
-            photo_upload_log(
-                f"stage=webdav_fallback done status=uploaded, nas_path={nas_path}, "
-                f"file_station_error={filestation_error}"
-            )
-            return nas_path
-        except Exception as webdav_exc:
-            webdav_error = (
-                webdav_exc.detail
-                if isinstance(webdav_exc, HTTPException)
-                else str(webdav_exc)
-            )
-            photo_upload_log(
-                f"stage=webdav_fallback failed file_station_error={filestation_error}, "
-                f"webdav_error_type={type(webdav_exc).__name__}, webdav_error={webdav_error}",
-                error=True,
-            )
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "NAS upload failed: "
-                    f"File Station error={filestation_error}; "
-                    f"WebDAV error={webdav_error}"
-                ),
-            ) from webdav_exc
 
-
+    
 def normalize_inspection_photo_row(row: dict) -> dict:
     normalized = {**INSPECTION_PHOTO_DEFAULTS, **(row or {})}
     if not str(normalized.get("nas_filename") or "").strip():

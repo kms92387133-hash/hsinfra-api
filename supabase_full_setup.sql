@@ -11,6 +11,10 @@ create table if not exists public.companies (
   building_type text not null default '',
   manager text not null default '',
   phone text not null default '',
+  contract_manager text not null default '',
+  contract_phone text not null default '',
+  third_manager text not null default '',
+  third_phone text not null default '',
   contact_memo text not null default '',
   created_at timestamptz not null default now()
 );
@@ -22,6 +26,10 @@ alter table public.companies
   add column if not exists building_type text not null default '',
   add column if not exists manager text not null default '',
   add column if not exists phone text not null default '',
+  add column if not exists contract_manager text not null default '',
+  add column if not exists contract_phone text not null default '',
+  add column if not exists third_manager text not null default '',
+  add column if not exists third_phone text not null default '',
   add column if not exists contact_memo text not null default '',
   add column if not exists created_at timestamptz not null default now();
 
@@ -37,6 +45,7 @@ create index if not exists companies_building_type_idx
 create table if not exists public.inspections (
   id uuid primary key default gen_random_uuid(),
   company_id uuid references public.companies(id) on delete set null,
+  inspector_name text not null default '',
   date date not null,
   category text not null default '유지보수',
   created_at timestamptz not null default now()
@@ -44,6 +53,7 @@ create table if not exists public.inspections (
 
 alter table public.inspections
   add column if not exists company_id uuid references public.companies(id) on delete set null,
+  add column if not exists inspector_name text not null default '',
   add column if not exists date date,
   add column if not exists category text not null default '유지보수',
   add column if not exists calendar_event_uid text not null default '',

@@ -2,6 +2,7 @@
 -- Run this in Supabase SQL Editor before deploying the backend change.
 
 alter table public.inspections
+  add column if not exists inspector_name text not null default '',
   add column if not exists calendar_event_uid text not null default '',
   add column if not exists calendar_scope text not null default 'company_shared',
   add column if not exists calendar_url text not null default '',
